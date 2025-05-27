@@ -1,10 +1,11 @@
-# pycsmeter
+# pycsmeter - Python API for CS Meter Water Softner
+
 
 [![ci](https://github.com/ptorsten/pycsmeter/workflows/ci/badge.svg)](https://github.com/ptorsten/pycsmeter/actions?query=workflow%3Aci)
 [![documentation](https://img.shields.io/badge/docs-mkdocs-708FCC.svg?style=flat)](https://ptorsten.github.io/pycsmeter/)
 [![pypi version](https://img.shields.io/pypi/v/pycsmeter.svg)](https://pypi.org/project/pycsmeter/)
+[![Version](https://img.shields.io/pypi/pyversions/pycsmeter.svg)](https://pypi.python.org/pypi/pycsmeter)
 
-Python API for CS Meter Water Softner
 
 ## Installation
 

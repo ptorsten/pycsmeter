@@ -6,6 +6,16 @@ on:
     branches:
     - main
 
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Used to avoid concurrency issues
+concurrency:
+  group: github-pages
+  cancel-in-progress: false
+
 defaults:
   run:
     shell: bash
@@ -21,7 +31,6 @@ jobs:
   quality:
 
     runs-on: ubuntu-latest
-
     steps:
     - name: Checkout
       uses: actions/checkout@v4
@@ -77,7 +86,6 @@ jobs:
         - "3.11"
         - "3.12"
         - "3.13"
-        - "3.14"
         resolution:
         - highest
         - lowest-direct
@@ -122,3 +130,34 @@ jobs:
 
     - name: Run the test suite
       run: ./scripts/make test
+  docs:
+    needs:
+      - quality
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }} # Retrieved from deploy-pages action
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: 3.x
+      - run: echo "cache_id=$(date --utc '+%V')" >> $GITHUB_ENV 
+      - uses: actions/cache@v4
+        with:
+          key: mkdocs-material-${{ env.cache_id }}
+          path: .cache 
+          restore-keys: |
+            mkdocs-material-
+      - run: pip install mkdocs-material 
+      - run: pip install markdown-callouts markdown-exec mkdocs-coverage
+      - run: pip install mkdocs-git-revision-date-localized-plugin
+      - run: pip install mkdocs-minify-plugin mkdocs-section-index mkdocstrings
+      - run: pip install "mkdocstrings[python]"
+      - run: mkdocs build 
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: 'site/'
+      - uses: actions/deploy-pages@v4
+        id: deployment
