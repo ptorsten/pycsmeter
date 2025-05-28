@@ -773,7 +773,7 @@ class TestValveData:
         data = json.loads(json_str)
         assert "dashboard" in data
         assert "advanced" in data
-        assert "history" in data
+        assert "water_usage_history" in data
 
         # Test with indent
         json_str_indented = valve_data.to_json(indent=2)
