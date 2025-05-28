@@ -1,39 +1,10 @@
 import json
 import struct
-from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+import typing
+from datetime import date, datetime, timedelta
 from typing import Optional
 
 from pycsmeter.exceptions import PacketParseError
-
-
-class EmptyPacket:
-    """Represents an empty packet placeholder."""
-
-    def __init__(self):
-        """Initialize an empty packet."""
-
-    def validate(self) -> None:
-        """Validate the empty packet (no-op)."""
-        # Nothing to validate, always valid
-
-    @staticmethod
-    def from_bytes(data: Optional[bytes] = None) -> "EmptyPacket":  # noqa: ARG004
-        """Create an EmptyPacket from bytes."""
-        # Accepts None or any bytes, just returns empty
-        return EmptyPacket()
-
-    def to_json(self, indent: Optional[int] = None) -> str:
-        """Return JSON representation of an empty packet."""
-        return json.dumps({}, indent=indent)
-
-    def __repr__(self):
-        """Return a string representation of the empty packet."""
-        return "<ValveEmptyPacket>"
-
-    def __eq__(self, other: object) -> bool:
-        """Check equality with another EmptyPacket."""
-        return isinstance(other, EmptyPacket)
 
 
 class InvalidPacket:
@@ -75,7 +46,6 @@ class DashboardPacket:
         self.hour = data[3] + (12 if data[5] == 1 and data[3] < 12 else 0)
         self.minute = data[4]
         self.hour_pm = data[5]
-        # battery adc is data[6]
         self.battery_adc = data[6]
         self.battery_volt = self.battery_adc * 0.08797
         self.current_flow = struct.unpack(">H", data[7:9])[0] / 100.0
@@ -83,7 +53,6 @@ class DashboardPacket:
         self.treated_usage_today = struct.unpack(">H", data[11:13])[0]
         self.peak_flow_today = struct.unpack(">H", data[13:15])[0] / 100.0
         self.water_hardness = data[15]
-        # regen_hour is data[16], pm flag is data[17]
         self.regen_hour_raw = data[16]
         self.regen_hour_pm = data[17]
         self.regen_hour = self.regen_hour_raw + (12 if self.regen_hour_pm == 1 and self.regen_hour_raw < 12 else 0)
@@ -210,94 +179,121 @@ class AdvancedPacket:
         return self.regen_days == other.regen_days and self.days_to_regen == other.days_to_regen
 
 
-@dataclass
-class HistoryItem:
-    """A dataclass representing a single day's history entry."""
+class WaterUsageHistoryItem(typing.NamedTuple):
+    date: date
+    gallons_per_day: float
 
-    item_date: date  # Should be a datetime.date object
-    gallon_per_day: float
+class WaterUsageHistoryPacket:
+    """Represents a sequence of daily water usage history items from BLE."""
 
-    def validate(self) -> None:
-        """Validate the HistoryItem fields."""
-        if not isinstance(self.gallon_per_day, (int, float)):
-            raise TypeError("gallon_per_day must be numeric")
-        if not (0.0 <= self.gallon_per_day <= 2550.0):
-            raise TypeError(f"gallon_per_day out of range: {self.gallon_per_day}")
-        # date should be a datetime.date
-        if not hasattr(self.item_date, "isoformat"):
-            raise ValueError("date must be a date object")
+    def __init__(self, chunks: list[bytes]):
+        """Initialize a WaterUsageHistoryPacket with raw packet chunks.
 
-    @staticmethod
-    def from_bytes(item_date: date, byte_val: int) -> "HistoryItem":
-        """Create a HistoryItem from raw bytes and date."""
-        # byte_val is a single int/byte
-        gallon_per_day = float(byte_val) * 10.0
-        item = HistoryItem(item_date=item_date, gallon_per_day=gallon_per_day)
-        item.validate()
-        return item
+        Args:
+            chunks: List of raw packet chunks to merge
 
-    def to_json(self, indent: Optional[int] = None) -> str:
-        """Return JSON representation of the history item."""
-        # date is a datetime.date
-        d = {"item_date": self.item_date.isoformat(), "gallon_per_day": self.gallon_per_day}
-        return json.dumps(d, indent=indent)
+        Raises:
+            PacketParseError: If given raw chunks that cannot be merged into valid history data
+        """
+        if not chunks:
+            raise PacketParseError("No water usage history chunks provided")
 
-    def __eq__(self, other: object) -> bool:
-        """Check equality with another HistoryItem."""
-        if not isinstance(other, HistoryItem):
-            return False
-        return self.item_date == other.item_date and self.gallon_per_day == other.gallon_per_day
+        # Process raw packet chunks
+        self.history_data = self._merge_history_chunks(chunks)
 
-
-class HistoryPacket:
-    """Represents a sequence of daily history items from BLE."""
-
-    def __init__(self, items: list[HistoryItem]):
-        """Initialize a HistoryPacket with a list of HistoryItems."""
-        if len(items) != 62:
-            raise ValueError(f"HistoryPacket expects 62 items, got {len(items)}")
-        self.history_gallons_per_day = items
-
-    def validate(self) -> None:
-        """Validate the HistoryPacket items."""
-        if len(self.history_gallons_per_day) != 62:
-            raise ValueError(
-                f"HistoryPacket expects 62 items, got {len(self.history_gallons_per_day)}",
-            )
-        for item in self.history_gallons_per_day:
-            item.validate()
+        self.yesterday = datetime.now().date() - timedelta(days=1)  # noqa: DTZ005
 
     @staticmethod
-    def from_bytes(data: bytes, start_date: date) -> "HistoryPacket":
-        """Create a validated HistoryPacket from raw bytes and start date."""
-        # data: 62 bytes, start_date: datetime.date
-        if len(data) != 62:
-            raise ValueError("History data must be 62 bytes")
-        from datetime import timedelta
+    def _merge_history_chunks(chunks: list[bytes]) -> bytes:
+        """Merge multiple water usage history packet chunks into a single byte array."""
+        if not chunks:
+            raise PacketParseError("No history chunks provided")
 
-        items = []
-        current_date = start_date
-        for val in reversed(data):
-            items.append(HistoryItem.from_bytes(current_date, val))
-            current_date -= timedelta(days=1)
-        pkt = HistoryPacket(items)
-        pkt.validate()
-        return pkt
+        if len(chunks) != 4:
+            raise PacketParseError("Invalid number of history chunks")
+
+        # First chunk should be 17 bytes after header
+        if len(chunks[0]) < 19 or chunks[0][0:2] != b"\x75\x75" or chunks[0][2] != 2:
+            raise PacketParseError("Invalid first water usage history chunk")
+
+        history_data = list(chunks[0][3:20])  # Skip header bytes
+        # Second chunk should be 20 bytes
+        if len(chunks[1]) < 20:
+            raise PacketParseError("Second history chunk too short")
+        history_data.extend(chunks[1][0:20])
+
+        # Third chunk should be 20 bytes
+        if len(chunks[2]) < 20:
+            raise PacketParseError("Third history chunk too short")
+        history_data.extend(chunks[2][0:20])
+
+        # Fourth chunk should be 5 bytes
+        if len(chunks[3]) < 5:
+            raise PacketParseError("Fourth history chunk too short")
+        history_data.extend(chunks[3][0:5])
+
+        return bytes(history_data)
+
+    def validate(self) -> None:
+        """Validate the water usage history data."""
+        if len(self.history_data) != 62:
+            raise ValueError(f"History data must be 62 bytes, got {len(self.history_data)}")
+
+    def get_history_for_date(self, target_date: date) -> Optional[float]:
+        """Return the gallons per day for a specific date, if available.
+
+        Args:
+            target_date: The date to get history for
+
+        Returns:
+            Gallons per day for the date if found, None if date not in history
+        """
+        # Calculate days ago from yesterday
+        days_ago = (self.yesterday - target_date).days
+
+        if 0 <= days_ago < 62:
+            # Each history entry is 1 byte
+            gallons = self.history_data[days_ago]
+            return float(gallons) * 10.0
+        return None
+
+    def get_history_last_n_days(self, n: int) -> list[WaterUsageHistoryItem]:
+        """Return the most recent n days of water usage history.
+
+        Args:
+            n: Number of days of history to return
+
+        Returns:
+            List of (date, gallons) tuples, most recent first
+        """
+        n = min(n, 62)  # Cap at 62 days
+
+        result = []
+        for i in range(n):
+            entry_date = self.yesterday - timedelta(days=i)
+            # Each history entry is 1 byte
+            gallons = self.history_data[i]
+            result.append(WaterUsageHistoryItem(date=entry_date, gallons_per_day=float(gallons) * 10.0))
+        return result
 
     def to_json(self, indent: Optional[int] = None) -> str:
-        """Return JSON representation of the history packet."""
-        arr = [item.to_json() for item in self.history_gallons_per_day]
-        return json.dumps(arr, indent=indent)
+        """Return JSON representation of the water usage history data."""
+        history = []
+
+        for i in range(len(self.history_data)):  # Each entry is 1 byte
+            entry_date = self.yesterday - timedelta(days=i)
+            # Each history entry is 1 byte
+            gallons = self.history_data[i]
+            history.append({
+                "date": entry_date.isoformat(),
+                "gallons_per_day": float(gallons) * 10.0,
+            })
+
+        return json.dumps(history, indent=indent)
 
     def __repr__(self) -> str:
-        """Return string representation of the history packet."""
-        return f"<HistoryPacket {len(self.history_gallons_per_day)} items>"
-
-    def __eq__(self, other: object) -> bool:
-        """Check equality with another HistoryPacket."""
-        if not isinstance(other, HistoryPacket):
-            return False
-        return self.history_gallons_per_day == other.history_gallons_per_day
+        """Return string representation of the water usage history packet."""
+        return "<WaterUsageHistoryPacket 62 bytes>"
 
 
 class HelloPacket:
@@ -449,130 +445,110 @@ class PacketParser:
 
     def __init__(self):
         """Initialize the PacketParser."""
-        # Buffer for history data packets
-        self.history_data = []
 
-    async def parse_packet(self, data: bytes) -> object:
-        """Parse a raw BLE packet into a structured object."""
-        # Handle ongoing history data buffering
-        if self.history_data:
-            # If we have already buffered first chunk (len 17)
-            if len(self.history_data) == 17:
-                if len(data) == 6:
-                    # Unexpected end, reset
-                    self.history_data = []
-                    return InvalidPacket()
-                # Buffer second chunk (20 bytes)
-                self.history_data += list(data[0:20])
-                # Now length should be 37
-                # Return empty packet to indicate waiting for more
-                return EmptyPacket()
+    async def parse(self, data: list[bytes]) -> object:
+        """Parse a list of raw BLE packets into a structured object.
 
-            if len(self.history_data) == 37:
-                if len(data) == 6:
-                    # Unexpected end, reset
-                    self.history_data = []
-                    return InvalidPacket()
-                # Buffer third chunk (20 bytes)
-                self.history_data += list(data[0:20])
-                # Now length should be 57
-                # Return empty packet to indicate waiting for more
-                return EmptyPacket()
+        Args:
+            data: List of raw packet data to parse
 
-            if len(self.history_data) == 57:
-                self.history_data += list(data[0:5])
-                # Now length should be 62
-                # Build history items: 62 days, most recent first (reverse order)
-                items = []
+        Returns:
+            Parsed packet object
 
-                # Start from yesterday
-                current_date = datetime.now(timezone.utc).date() - timedelta(days=1)
-                for val in reversed(self.history_data):
-                    item = HistoryItem.from_bytes(current_date, val)
-                    items.append(item)
-                    current_date -= timedelta(days=1)
-                # Reset buffer
-                self.history_data = []
-                # Return packet
-                historypkt = HistoryPacket(items)
-                historypkt.validate()
-                return historypkt
-            # If for some reason it's not the expected length, return empty
-            self.history_data = []
-            return InvalidPacket()
+        Raises:
+            PacketParseError: If a packet cannot be parsed
+        """
+        if len(data) == 0:
+            raise PacketParseError("No data provided")
 
         # Hello packet
-        if data[0] == 0x74 and data[1] == 0x74 and data[2] == 0:
-            hellopkt = HelloPacket(data)
+        if data[0][0] == 0x74 and data[0][1] == 0x74 and data[0][2] == 0:
+            if len(data) != 1:
+                raise PacketParseError("Expected only one data chunk for hello packet")
+
+            hellopkt = HelloPacket(data[0])
             hellopkt.validate()
             return hellopkt
 
         # Dashboard or advanced or history packets
-        if data[0] == 0x75 and data[1] == 0x75:
-            if data[2] == 0:
-                dashboardpkt = DashboardPacket(data)
+        if data[0][0] == 0x75 and data[0][1] == 0x75:
+            if data[0][2] == 0:
+                if len(data) != 1:
+                    raise PacketParseError("Expected only one data chunk for hello packet")
+
+                dashboardpkt = DashboardPacket(data[0])
                 dashboardpkt.validate()
                 return dashboardpkt
 
-            if data[2] == 1:
-                advancedpkt = AdvancedPacket(data)
+            if data[0][2] == 1:
+                if len(data) != 1:
+                    raise PacketParseError("Expected only one data chunk for hello packet")
+
+                advancedpkt = AdvancedPacket(data[0])
                 advancedpkt.validate()
                 return advancedpkt
 
-            if data[2] == 2 and not self.history_data:
-                # Buffer first chunk (data[2:19], 17 bytes)
-                self.history_data = list(data[2:19])
-                return EmptyPacket()
+            if data[0][2] == 2:
+                if len(data) != 4:
+                    raise PacketParseError("Expected four data chunks for history packet")
+
+                history_packet = WaterUsageHistoryPacket(data)
+                history_packet.validate()
+                return history_packet
 
         # Unknown packet
-        raise PacketParseError(f"Unknown packet type: {data!r}")
+        raise PacketParseError(f"Unknown packet type: {data[0]!r}")
 
 
 class ValveData:
     """Aggregates Dashboard, Advanced, and History packet data."""
 
-    def __init__(self, dashboard: DashboardPacket, advanced: AdvancedPacket, history: HistoryPacket):
+    def __init__(self, dashboard: DashboardPacket, advanced: AdvancedPacket, history: WaterUsageHistoryPacket):
         """Initialize ValveData with dashboard, advanced, and history."""
         self.dashboard = dashboard
         self.advanced = advanced
-        self.history = history
+        self.water_usage_history = history
 
-    def get_history(self) -> list[HistoryItem]:
-        """Return the list of HistoryItem objects, newest first."""
-        return self.history.history_gallons_per_day
+    def get_history(self) -> list[WaterUsageHistoryItem]:
+        """Return the list of WaterUsageHistoryItem objects, newest first."""
+        return self.water_usage_history.get_history_last_n_days(62)  # Get all 62 days
 
-    def get_history_for_date(self, date_obj: object) -> Optional[HistoryItem]:
-        """Return the HistoryItem for the given date, or None if not found.
+    def get_history_for_date(self, target_date: date) -> Optional[float]:
+        """Return the gallons per day for a specific date, if available."""
+        return self.water_usage_history.get_history_for_date(target_date)
 
-        date_obj should be a datetime.date.
-        """
-        for item in self.history.history_gallons_per_day:
-            if item.item_date == date_obj:
-                return item
-        return None
-
-    def get_history_last_n_days(self, n: int) -> list[HistoryItem]:
-        """Return the most recent n HistoryItem entries."""
-        return self.history.history_gallons_per_day[:n]
+    def get_history_last_n_days(self, n: int) -> list[WaterUsageHistoryItem]:
+        """Return the most recent n WaterUsageHistoryItem entries."""
+        return self.water_usage_history.get_history_last_n_days(n)
 
     def validate(self) -> None:
         """Validate all contained packets."""
         self.dashboard.validate()
         self.advanced.validate()
-        self.history.validate()
+        self.water_usage_history.validate()
 
     def to_json(self, indent: Optional[int] = None) -> str:
         """Return JSON representation of all valve data."""
+        water_usage_history_items = self.get_history()
+        water_usage_history_json = [
+            {
+                "date": item.date.isoformat(),
+                "gallons_per_day": item.gallons_per_day,
+            }
+            for item in water_usage_history_items
+        ]
+
         data = {
             "dashboard": json.loads(self.dashboard.to_json()),
             "advanced": json.loads(self.advanced.to_json()),
-            "history": json.loads(self.history.to_json()),
+            "water_usage_history": water_usage_history_json,
         }
         return json.dumps(data, indent=indent)
 
     def __repr__(self):
         """Return string representation of the ValveData."""
+        history_items = self.get_history()
         return (
             f"<ValveData dashboard={self.dashboard!r} advanced={self.advanced!r} "
-            f"history_items={len(self.history.history_gallons_per_day)}>"
+            f"history_items={len(history_items)}>"
         )

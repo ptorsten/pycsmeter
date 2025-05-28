@@ -1,3 +1,5 @@
+"""Exceptions for pycsmeter."""
+
 class ValveError(Exception):
     """Base exception for valve-related errors."""
 

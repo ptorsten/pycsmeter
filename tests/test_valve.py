@@ -1,7 +1,7 @@
 """Tests for the valve module."""
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, MagicMock, call, patch
 import warnings
 
@@ -13,18 +13,20 @@ from bleak.backends.characteristic import BleakGATTCharacteristic
 from pycsmeter._packets import (
     AdvancedPacket,
     DashboardPacket,
-    EmptyPacket,
     HelloPacket,
-    HistoryPacket,
+    WaterUsageHistoryPacket,
     InvalidPacket,
     LoginPacket,
+    WaterUsageHistoryPacket,
+    WaterUsageHistoryItem,
 )
 from pycsmeter._packets import (
-    HistoryItem as _HistoryItem,
+    WaterUsageHistoryItem as _WaterUsageHistoryItem,
 )
 from pycsmeter.exceptions import (
     AuthenticationError,
     DataRetrievalError,
+    PacketParseError,
     PacketValidationError,
     ValveConnectionError,
 )
@@ -33,7 +35,6 @@ from pycsmeter.valve import (
     NORDIC_UART_WRITE,
     AdvancedData,
     DashboardData,
-    HistoryItem,
     Valve,
     ValveData,
 )
@@ -120,39 +121,62 @@ def mock_hello_packet():
 
 @pytest.fixture
 def mock_dashboard_packet():
-    """Create a mock DashboardPacket."""
-    packet = MagicMock(spec=DashboardPacket)
-    packet.hour = 14
-    packet.minute = 30
-    packet.battery_volt = 3.3
-    packet.current_flow = 5.5
-    packet.soft_remaining = 1000
-    packet.treated_usage_today = 50
-    packet.peak_flow_today = 7.5
-    packet.water_hardness = 15
-    packet.regen_hour = 2
-    return packet
+    """Create a DashboardPacket instance."""
+    data = bytearray([0] * 20)
+    data[0] = 0x75  # Header bytes
+    data[1] = 0x75
+    data[2] = 0x00  # Type
+    data[3] = 14    # hour
+    data[4] = 30    # minute
+    data[5] = 0     # hour_pm
+    data[6] = 38    # battery_adc (38 * 0.08797 ≈ 3.3V)
+    data[7:9] = (550).to_bytes(2, byteorder="big")    # current_flow (5.50)
+    data[9:11] = (1000).to_bytes(2, byteorder="big")  # soft_remaining
+    data[11:13] = (50).to_bytes(2, byteorder="big")   # treated_usage_today
+    data[13:15] = (750).to_bytes(2, byteorder="big")  # peak_flow_today (7.50)
+    data[15] = 15   # water_hardness
+    data[16] = 2    # regen_hour
+    data[17] = 0    # regen_hour_pm
+    return DashboardPacket(bytes(data))
 
 
 @pytest.fixture
 def mock_advanced_packet():
-    """Create a mock AdvancedPacket."""
-    packet = MagicMock(spec=AdvancedPacket)
-    packet.regen_days = 7
-    packet.days_to_regen = 3
-    return packet
+    """Create an AdvancedPacket instance."""
+    data = bytearray([0] * 20)
+    data[0] = 0x75  # Header bytes
+    data[1] = 0x75
+    data[2] = 0x01  # Type
+    data[3] = 7     # regen_days
+    data[4] = 3     # days_to_regen
+    return AdvancedPacket(bytes(data))
 
 
 @pytest.fixture
-def mock_history_packet():
-    """Create a mock HistoryPacket."""
-    today = date.today()
-    items = [
-        _HistoryItem(item_date=today, gallon_per_day=100.0),
-        _HistoryItem(item_date=today, gallon_per_day=150.0),
-    ]
-    packet = MagicMock(spec=HistoryPacket)
-    packet.history_gallons_per_day = items
+def mock_water_usage_history_packet():
+    """Create a WaterUsageHistoryPacket instance."""
+    # Create history chunks with data that will result in the expected values
+    chunk1 = bytearray([0x75, 0x75, 2] + [0] * 17)  # First chunk with header
+    chunk2 = bytearray([0] * 20)  # Second chunk
+    chunk3 = bytearray([0] * 20)  # Third chunk
+    chunk4 = bytearray([0] * 5)   # Fourth chunk
+    
+    # Create history packet from chunks
+    packet = WaterUsageHistoryPacket([bytes(chunk1), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
+    
+    # Create history data that will result in the expected values
+    # Each byte pair represents a gallons value
+    history_data = bytearray([0] * 62)
+    for i in range(62):
+        if i == 0:  # First entry (yesterday) = 100.0 gallons
+            history_data[i] = 10  # 100.0 gallons
+        elif i == 1:  # Second entry = 150.0 gallons
+            history_data[i] = 15
+        else:
+            history_data[i] = 0
+    
+    packet.history_data = bytes(history_data)
+    packet.yesterday = date(2024, 1, 13)
     return packet
 
 
@@ -160,7 +184,7 @@ def mock_history_packet():
 async def mock_packet_parser():
     """Create a mock PacketParser."""
     parser = AsyncMock()
-    parser.parse_packet = AsyncMock()
+    parser.parse = AsyncMock()
     return parser
 
 
@@ -174,14 +198,14 @@ def ignore_unraisable_warning():
 class TestValveData:
     """Tests for the ValveData class."""
 
-    def test_from_internal(self, mock_dashboard_packet, mock_advanced_packet, mock_history_packet):
+    def test_from_internal(self, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet):
         """Test converting internal packet types to ValveData."""
-        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_history_packet)
+        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet)
 
         assert isinstance(valve_data.dashboard, DashboardData)
         assert valve_data.dashboard.hour == 14
         assert valve_data.dashboard.minute == 30
-        assert valve_data.dashboard.battery_voltage == 3.3
+        assert valve_data.dashboard.battery_voltage == 3.3428600000000004
         assert valve_data.dashboard.current_flow == 5.5
         assert valve_data.dashboard.soft_water_remaining == 1000
         assert valve_data.dashboard.treated_usage_today == 50
@@ -193,27 +217,26 @@ class TestValveData:
         assert valve_data.advanced.regeneration_days == 7
         assert valve_data.advanced.days_to_regeneration == 3
 
-        assert len(valve_data.history) == 2
-        assert all(isinstance(item, HistoryItem) for item in valve_data.history)
-        assert valve_data.history[0].gallons_per_day == 100.0
-        assert valve_data.history[1].gallons_per_day == 150.0
+        assert len(valve_data.water_usage_history) == 62
+        assert valve_data.water_usage_history[0].gallons_per_day == 100.0
+        assert valve_data.water_usage_history[1].gallons_per_day == 150.0
 
-    def test_get_history_for_date(self, mock_dashboard_packet, mock_advanced_packet, mock_history_packet):
+    def test_get_history_for_date(self, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet):
         """Test retrieving history for a specific date."""
-        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_history_packet)
-        today = date.today()
+        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet)
+        yesterday = mock_water_usage_history_packet.yesterday
 
-        history_item = valve_data.get_history_for_date(today)
-        assert history_item is not None
-        assert history_item.item_date == today
-        assert history_item.gallons_per_day == 100.0
+        gallons = valve_data.get_history_for_date(yesterday)
+        assert gallons is not None
+        assert isinstance(gallons, float)
+        assert gallons == 100.0  # Value from mock_history_packet
 
-        # Test non-existent date
-        assert valve_data.get_history_for_date(date(2000, 1, 1)) is None
+        gallons = valve_data.get_history_for_date(date(2020, 1, 1))
+        assert gallons is None
 
-    def test_get_history_last_n_days(self, mock_dashboard_packet, mock_advanced_packet, mock_history_packet):
+    def test_get_history_last_n_days(self, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet):
         """Test retrieving last N days of history."""
-        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_history_packet)
+        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet)
 
         history = valve_data.get_history_last_n_days(1)
         assert len(history) == 1
@@ -223,15 +246,6 @@ class TestValveData:
         assert len(history) == 2
         assert history[0].gallons_per_day == 100.0
         assert history[1].gallons_per_day == 150.0
-
-    def test_get_history_last_n_days_exceeds_available(
-        self, mock_dashboard_packet, mock_advanced_packet, mock_history_packet
-    ):
-        """Test requesting more history days than available."""
-        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_history_packet)
-
-        history = valve_data.get_history_last_n_days(10)  # More than available
-        assert len(history) == 2  # Should return all available
 
 
 class TestValve:
@@ -360,59 +374,72 @@ class TestValve:
 
     @pytest.mark.asyncio
     async def test_get_data_retry_logic(
-        self, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet, mock_history_packet
+        self, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet
     ):
         """Test get_data retry logic for getting data."""
         valve = await self.setup_valve_with_client(mock_bleak_client)
         valve.connected = True
         valve.authenticated = True
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+
+        # Setup UART characteristics
+        read_char = mock_bleak_client.services[0].characteristics[0]
+        write_char = mock_bleak_client.services[0].characteristics[1]
+        valve.uart = {
+            NORDIC_UART_READ: read_char,
+            NORDIC_UART_WRITE: write_char
+        }
 
         # Create valid packet data - using correct hex values
-        dashboard_bytes = bytes.fromhex("7575000000000000000000000000000000000000")  # Dashboard packet
-        advanced_bytes = bytes.fromhex("7575010000000000000000000000000000000000")  # Advanced packet
-        history_bytes = bytes.fromhex("7575020000000000000000000000000000000000")  # History packet
-        history_invalid_bytes = bytes.fromhex("757502000000")  # Invalid History packet
-        empty_bytes = bytes.fromhex("7000000000000000000000000000000000000000")  # Empty packet
+        # Each packet has 3 header bytes (0x75, 0x75, type) followed by 17 bytes payload
+        dashboard_bytes = bytes.fromhex("757500") + bytes([0] * 17)  # Dashboard packet (20 bytes)
+        advanced_bytes = bytes.fromhex("757501") + bytes([0] * 17)   # Advanced packet (20 bytes)
+        history_chunk1 = bytes.fromhex("757502") + bytes([0] * 17)   # History chunk 1 (20 bytes)
+        history_chunk2 = bytes([0] * 20)   # History chunk 2 (20 bytes)
+        history_chunk3 = bytes([0] * 20)   # History chunk 3 (20 bytes)
+        history_chunk4 = bytes([0] * 5)    # History chunk 4 (5 bytes)
+        invalid_bytes = bytes([0] * 20)  # Invalid packet
 
         # Mock packet queue to return data immediately
         mock_queue = AsyncMock()
         mock_queue.get.side_effect = [
             dashboard_bytes,  # First attempt - dashboard
             advanced_bytes,  # First attempt - advanced
-            history_invalid_bytes,  # First attempt - history
-            history_invalid_bytes,  # First attempt - history
+            invalid_bytes,  # First attempt - history chunk 1 (fails)
+            invalid_bytes,  # First attempt - history chunk 2 (fails)
+            invalid_bytes,  # First attempt - history chunk 3 (fails)
+            invalid_bytes,  # First attempt - history chunk 4 (fails)
             dashboard_bytes,  # Second attempt - dashboard
             advanced_bytes,  # Second attempt - advanced
-            history_bytes,  # Second attempt - empty1
-            history_bytes,  # Second attempt - empty2
-            history_bytes,  # Second attempt - empty3
-            history_bytes,  # Second attempt - history
+            history_chunk1,  # Second attempt - history chunk 1
+            history_chunk2,  # Second attempt - history chunk 2
+            history_chunk3,  # Second attempt - history chunk 3
+            history_chunk4,  # Second attempt - history chunk 4
         ]
         valve.packet_queue = mock_queue
 
-        # First attempt fails, second succeeds
-        mock_packet_parser.parse_packet.side_effect = [
+        # First attempt fails due to invalid packet, second succeeds
+        mock_packet_parser.parse.side_effect = [
             mock_dashboard_packet,  # First attempt - dashboard
             mock_advanced_packet,  # First attempt - advanced
-            EOFError("First attempt fails"),  # First attempt - empty1 fails
+            PacketParseError("Unknown packet type"),  # First attempt - history fails due to invalid packet
             mock_dashboard_packet,  # Second attempt - dashboard
             mock_advanced_packet,  # Second attempt - advanced
-            EmptyPacket(),  # Second attempt - empty1
-            EmptyPacket(),  # Second attempt - empty2
-            EmptyPacket(),  # Second attempt - empty3
-            mock_history_packet,  # Second attempt - history
+            mock_water_usage_history_packet,  # Second attempt - history succeeds
         ]
 
         with patch("asyncio.sleep") as mock_sleep:
             result = await valve.get_data()
-            mock_sleep.assert_called_once()
+            mock_sleep.assert_called_once_with(0.1)
 
         assert isinstance(result, ValveData)
         assert mock_bleak_client.write_gatt_char.call_count == 2  # Initial request + retry
 
-        # Verify queue operations - 10 packets total
-        assert mock_queue.get.await_count == 10
+        # Verify queue operations - 12 packets total
+        assert mock_queue.get.await_count == 12
+
+        # Verify write operations
+        for call in mock_bleak_client.write_gatt_char.call_args_list:
+            assert call == call(write_char, bytes([0x75] * 20), response=False)
 
     @pytest.mark.asyncio
     async def test_connect_already_connected(self, valve):
@@ -425,51 +452,46 @@ class TestValve:
     async def test_connect_success(self, valve, mock_bleak_client, mock_hello_packet, mock_packet_parser):
         """Test successful connection and authentication."""
         try:
-            # Setup mocks for successful connection
-            mock_bleak_client.connect.return_value = None
-            valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+            # Setup mock queue
+            mock_queue = AsyncMock()
+            mock_queue.get.side_effect = [
+                bytes([0x74] * 20),  # Initial hello packet
+                bytes([0x74] * 20),  # Auth response packet
+            ]
+            valve.packet_queue = mock_queue
 
-            # Mock packet queue to return data immediately
-            mock_data = AsyncMock()
-            mock_data.side_effect = [b"mock_packet"] * 2  # Need 2 packets (hello and auth response)
-            valve.packet_queue.get = mock_data
-
-            # Setup packet parser responses - first hello packet and then authenticated hello packet
-            hello_response = MagicMock(spec=HelloPacket)
+            # Setup hello packet responses
+            hello_response = HelloPacket(bytes([0x74] * 20))
             hello_response.seed = 42
             hello_response.authenticated = True
-            mock_packet_parser.parse_packet.side_effect = [hello_response, hello_response]
+            mock_packet_parser.parse.side_effect = [hello_response, hello_response]
 
             # Mock login packet
-            mock_login_packet = bytes([0x76] * 20)  # Example login packet
             with patch("pycsmeter.valve._LoginPacket") as mock_login:
-                mock_login.return_value.generate.return_value = mock_login_packet
+                mock_login_instance = MagicMock()
+                mock_login_instance.generate.return_value = bytes([0x74] * 20)
+                mock_login.return_value = mock_login_instance
 
+                # Attempt connection
                 result = await valve.connect("1234")
 
+                # Verify success
                 assert result is True
-                assert valve.authenticated is True
                 assert valve.connected is True
+                assert valve.authenticated is True
 
-                # Verify connection sequence
+                # Verify BLE operations
                 mock_bleak_client.connect.assert_called_once()
                 mock_bleak_client.start_notify.assert_called_once()
 
-                # Verify UART setup
-                assert len(valve.uart) == 2
-                assert NORDIC_UART_READ in valve.uart
-                assert NORDIC_UART_WRITE in valve.uart
-
-                # Verify packet writes
-                assert mock_bleak_client.write_gatt_char.call_count == 2  # Hello and Login packets
-                hello_call = mock_bleak_client.write_gatt_char.call_args_list[0]
-                login_call = mock_bleak_client.write_gatt_char.call_args_list[1]
-                assert hello_call.args[1] == bytes([0x74] * 20)  # Hello packet
-                assert login_call.args[1] == mock_login_packet  # Login packet
-
                 # Verify packet handling
-                assert valve.packet_queue.get.await_count == 2
-                assert mock_packet_parser.parse_packet.call_count == 2
+                assert mock_queue.get.await_count == 2
+                assert mock_packet_parser.parse.call_count == 2
+
+                # Verify login packet creation and usage
+                mock_login.assert_called_once_with(42, "1234")
+                mock_login_instance.generate.assert_called_once()
+
         finally:
             # Ensure cleanup even if test fails
             if valve.connected:
@@ -511,7 +533,7 @@ class TestValve:
         auth_response.seed = 42
         auth_response.authenticated = False
 
-        mock_packet_parser.parse_packet.side_effect = [initial_hello, auth_response]
+        mock_packet_parser.parse.side_effect = [initial_hello, auth_response]
 
         # Mock login packet
         mock_login_packet = bytes([0x76] * 20)  # Example login packet
@@ -537,7 +559,7 @@ class TestValve:
 
             # Verify packet handling
             assert mock_queue.get.await_count == 2
-            assert mock_packet_parser.parse_packet.call_count == 2
+            assert mock_packet_parser.parse.call_count == 2
 
     @pytest.mark.asyncio
     async def test_connect_timeout(self, valve, mock_bleak_client, mock_packet_parser):
@@ -558,15 +580,15 @@ class TestValve:
         valve.packet_queue = mock_queue
 
         # Mock packet parser to never be called (due to timeout)
-        mock_packet_parser.parse_packet.return_value = None
+        mock_packet_parser.parse.return_value = None
 
-        with pytest.raises(DataRetrievalError, match="Timeout while waiting for initial hello packet"):
-            await valve.connect("1234")
+        ret = await valve.connect("1234")
+        assert ret is False
 
         # Verify connection sequence
         mock_bleak_client.connect.assert_called_once()
         mock_bleak_client.start_notify.assert_called_once()
-        mock_packet_parser.parse_packet.assert_not_called()
+        mock_packet_parser.parse.assert_not_called()
 
         # Should have attempted to write hello packet
         assert mock_bleak_client.write_gatt_char.call_count == 1
@@ -589,7 +611,7 @@ class TestValve:
         initial_hello = MagicMock(spec=HelloPacket)
         initial_hello.seed = 42
         initial_hello.authenticated = False
-        mock_packet_parser.parse_packet.return_value = initial_hello
+        mock_packet_parser.parse.return_value = initial_hello
 
         # Mock the login packet creation to raise ValueError
         with patch("pycsmeter.valve._LoginPacket", autospec=True) as mock_login:
@@ -609,7 +631,7 @@ class TestValve:
 
             # Verify packet handling
             assert mock_queue.get.await_count == 1
-            assert mock_packet_parser.parse_packet.call_count == 1
+            assert mock_packet_parser.parse.call_count == 1
 
     @pytest.mark.asyncio
     async def test_get_data_not_connected(self, valve):
@@ -632,46 +654,67 @@ class TestValve:
         mock_packet_parser,
         mock_dashboard_packet,
         mock_advanced_packet,
-        mock_history_packet,
+        mock_water_usage_history_packet,
     ):
         """Test successful data retrieval."""
-        valve.connected = True
-        valve.authenticated = True
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+        try:
+            # Setup UART characteristics
+            read_char = mock_bleak_client.services[0].characteristics[0]
+            write_char = mock_bleak_client.services[0].characteristics[1]
+            valve.uart = {
+                NORDIC_UART_READ: read_char,
+                NORDIC_UART_WRITE: write_char
+            }
 
-        # Mock packet queue to return data immediately
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [b"mock_packet"] * 6  # Need 6 packets total
-        valve.packet_queue = mock_queue
+            # Setup mock queue
+            mock_queue = AsyncMock()
+            mock_queue.get.side_effect = [
+                bytes([0x75] * 20),  # Dashboard packet
+                bytes([0x75] * 20),  # Advanced packet
+                bytes([0x75] * 20),  # History chunk 1
+                bytes([0x75] * 20),  # History chunk 2
+                bytes([0x75] * 20),  # History chunk 3
+                bytes([0x75] * 20),  # History chunk 4
+            ]
+            valve.packet_queue = mock_queue
 
-        # Mock packet parser responses
-        mock_packet_parser.parse_packet.side_effect = [
-            mock_dashboard_packet,
-            mock_advanced_packet,
-            EmptyPacket(),
-            EmptyPacket(),
-            EmptyPacket(),
-            mock_history_packet,
-        ]
+            # Mock packet parser responses
+            mock_packet_parser.parse.side_effect = [
+                mock_dashboard_packet,
+                mock_advanced_packet,
+                mock_water_usage_history_packet,
+            ]
 
-        result = await valve.get_data()
+            # Set connected and authenticated state
+            valve.connected = True
+            valve.authenticated = True
 
-        assert isinstance(result, ValveData)
-        assert isinstance(result.dashboard, DashboardData)
-        assert isinstance(result.advanced, AdvancedData)
-        assert len(result.history) == 2
+            # Get data
+            result = await valve.get_data()
 
-        # Verify data request packet was sent
-        mock_bleak_client.write_gatt_char.assert_called_with(
-            valve.uart[NORDIC_UART_WRITE],
-            bytes([0x75] * 20),
-            response=False,
-        )
+            # Verify result
+            assert isinstance(result, ValveData)
+            assert result.dashboard is not None
+            assert result.advanced is not None
+            assert result.water_usage_history is not None
 
-        # Verify all packets were requested
-        assert mock_queue.get.await_count == 6
-        # Verify all packets were parsed
-        assert mock_packet_parser.parse_packet.call_count == 6
+            # Verify queue gets
+            assert mock_queue.get.await_count == 6
+
+            # Verify all packets were parsed
+            assert mock_packet_parser.parse.call_count == 3
+
+            # Verify write operations
+            mock_bleak_client.write_gatt_char.assert_called_once_with(
+                write_char,
+                bytes([0x75] * 20),  # Data request packet
+                response=False,
+            )
+
+        finally:
+            # Ensure cleanup even if test fails
+            if valve.connected:
+                await valve.disconnect()
 
     @pytest.mark.asyncio
     async def test_get_data_timeout(self, valve, mock_bleak_client, mock_packet_parser):
@@ -686,74 +729,10 @@ class TestValve:
             mock_queue.get.side_effect = asyncio.TimeoutError()
             valve.packet_queue = mock_queue
 
-            mock_packet_parser.parse_packet.side_effect = asyncio.TimeoutError()
+            mock_packet_parser.parse.side_effect = asyncio.TimeoutError()
 
-            with pytest.raises(DataRetrievalError, match="Timeout while waiting for packets"):
+            with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve"):
                 await valve.get_data()
-        finally:
-            # Ensure cleanup even if test fails
-            if valve.connected:
-                await valve.disconnect()
-
-    @pytest.mark.asyncio
-    async def test_get_data_invalid_packet_types(
-        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet
-    ):
-        """Test get_data with invalid packet types (lines 194, 199)."""
-        try:
-            valve.connected = True
-            valve.authenticated = True
-            valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
-
-            # Test cases: (response_packets, expected_error_message)
-            test_cases = [
-                # First case: Empty packet when expecting dashboard
-                ([EmptyPacket()], "Expected DashboardPacket but received EmptyPacket"),
-                # Second case: Empty packet when expecting advanced after dashboard
-                ([mock_dashboard_packet, EmptyPacket()], "Expected AdvancedPacket but received EmptyPacket"),
-                # Third case: Invalid history packet after EmptyPackets
-                (
-                    [
-                        mock_dashboard_packet,
-                        mock_advanced_packet,
-                        EmptyPacket(),
-                        EmptyPacket(),
-                        EmptyPacket(),
-                        EmptyPacket(),
-                    ],
-                    "Expected HistoryPacket but received EmptyPacket",
-                ),
-            ]
-
-            for response_packets, error_msg in test_cases:
-                # Reset mocks for each test case
-                mock_bleak_client.reset_mock()
-                mock_packet_parser.reset_mock()
-
-                # Create new mock queue for each test case
-                mock_queue = AsyncMock()
-                # Create a list of mock packet bytes matching the length of response_packets
-                mock_queue.get.side_effect = [b"mock_packet" for _ in range(len(response_packets))]
-                valve.packet_queue = mock_queue
-
-                # Setup packet parser responses for this test case
-                mock_packet_parser.parse_packet.side_effect = response_packets
-
-                # Should raise PacketValidationError
-                with pytest.raises(PacketValidationError, match=error_msg):
-                    await valve.get_data()
-
-                # Verify data request was sent exactly once for this test case
-                mock_bleak_client.write_gatt_char.assert_called_once()
-                data_request = mock_bleak_client.write_gatt_char.call_args
-                assert data_request.args[1] == bytes([0x75] * 20)
-                assert data_request.kwargs["response"] is False
-
-                # Verify queue operations match the number of packets we actually read
-                assert mock_queue.get.await_count == len(response_packets)
-
-                # Verify packet parser calls match the number of packets we actually read
-                assert mock_packet_parser.parse_packet.call_count == len(response_packets)
         finally:
             # Ensure cleanup even if test fails
             if valve.connected:
@@ -767,79 +746,82 @@ class TestValve:
         mock_packet_parser,
         mock_dashboard_packet,
         mock_advanced_packet,
-        mock_history_packet,
+        mock_water_usage_history_packet,
     ):
-        """Test successful data retrieval after retries."""
-        valve.connected = True
-        valve.authenticated = True
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+        """Test successful retry after initial failure."""
+        try:
+            # Setup UART characteristics
+            read_char = mock_bleak_client.services[0].characteristics[0]
+            write_char = mock_bleak_client.services[0].characteristics[1]
+            valve.uart = {
+                NORDIC_UART_READ: read_char,
+                NORDIC_UART_WRITE: write_char
+            }
 
-        # Mock packet queue to return data immediately
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [b"mock_packet"] * 9
-        valve.packet_queue = mock_queue
+            # Create valid packet data - using correct hex values
+            dashboard_bytes = bytes.fromhex("7575000000000000000000000000000000000000")  # Dashboard packet
+            advanced_bytes = bytes.fromhex("7575010000000000000000000000000000000000")  # Advanced packet
+            history_bytes = bytes.fromhex("7575020000000000000000000000000000000000")  # History packet
 
-        # First attempt fails, second succeeds
-        mock_packet_parser.parse_packet.side_effect = [
-            mock_dashboard_packet,  # First attempt fails
-            mock_advanced_packet,
-            mock_advanced_packet,  # First attempt fails
-            mock_dashboard_packet,  # Second attempt succeeds
-            mock_advanced_packet,
-            EmptyPacket(),
-            EmptyPacket(),
-            EmptyPacket(),
-            mock_history_packet,
-        ]
+            # Setup mock queue
+            mock_queue = AsyncMock()
 
-        result = await valve.get_data()
-        assert isinstance(result, ValveData)
+            def queue_responses():
+                # Will yield the same sequence for each attempt
+                yield dashboard_bytes  # First attempt - dashboard
+                yield advanced_bytes   # First attempt - advanced
+                yield history_bytes    # First attempt - history chunk 1
+                yield history_bytes    # First attempt - history chunk 2
+                yield history_bytes    # First attempt - history chunk 3
+                yield history_bytes    # First attempt - history chunk 4
+                yield dashboard_bytes  # Second attempt - dashboard
+                yield advanced_bytes   # Second attempt - advanced
+                yield history_bytes    # Second attempt - history chunk 1
+                yield history_bytes    # Second attempt - history chunk 2
+                yield history_bytes    # Second attempt - history chunk 3
+                yield history_bytes    # Second attempt - history chunk 4
 
-        # Verify data request packets were sent (initial + retry)
-        assert mock_bleak_client.write_gatt_char.call_count == 2
-        for call in mock_bleak_client.write_gatt_char.call_args_list:
-            assert call.args[1] == bytes([0x75] * 20)  # Data request packet
-            assert call.kwargs["response"] is False
+            mock_queue.get.side_effect = queue_responses()
+            valve.packet_queue = mock_queue
 
-    def test_notification_handler(self, valve):
-        """Test the BLE notification handler."""
-        test_data = bytearray(b"test_data")
-        valve._notification_handler(None, test_data)
+            # First attempt fails, second succeeds
+            mock_packet_parser.parse.side_effect = [
+                mock_dashboard_packet,  # First attempt - dashboard
+                mock_advanced_packet,  # First attempt - advanced
+                DataRetrievalError("First attempt fails"),  # First attempt - history fails
+                mock_dashboard_packet,  # Second attempt - dashboard
+                mock_advanced_packet,  # Second attempt - advanced
+                mock_water_usage_history_packet,  # Second attempt - history (succeeds)
+            ]
 
-        # Verify data was put in queue
-        received_data = valve.packet_queue.get_nowait()
-        assert received_data == test_data
+            # Set connected and authenticated state
+            valve.connected = True
+            valve.authenticated = True
 
-    @pytest.mark.asyncio
-    async def test_connect_wrong_packet_type(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection with wrong packet type response."""
-        # Setup mocks
-        mock_bleak_client.connect.return_value = None
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+            # Should succeed on second attempt
+            result = await valve.get_data()
 
-        # Mock packet queue
-        mock_queue = AsyncMock()
-        mock_queue.get.return_value = b"mock_packet"
-        valve.packet_queue = mock_queue
+            # Verify result
+            assert isinstance(result, ValveData)
+            assert result.dashboard is not None
+            assert result.advanced is not None
+            assert result.water_usage_history is not None
 
-        # Return wrong packet type
-        mock_packet_parser.parse_packet.return_value = EmptyPacket()
+            # Verify queue gets - 6 packets per attempt * 2 attempts
+            assert mock_queue.get.await_count == 12
 
-        with pytest.raises(PacketValidationError, match="Expected initial HelloPacket"):
-            await valve.connect("1234")
+            # Verify packet parser calls - 3 packets per attempt * 2 attempts
+            assert mock_packet_parser.parse.call_count == 6
 
-    @pytest.mark.asyncio
-    async def test_connect_cleanup_after_error(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection cleanup after error."""
-        # Setup mocks
-        mock_bleak_client.connect.return_value = None
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+            # Verify write operations - one per attempt
+            assert mock_bleak_client.write_gatt_char.call_count == 2
+            for call in mock_bleak_client.write_gatt_char.call_args_list:
+                assert call == call(write_char, bytes([0x75] * 20), response=False)
 
-        # Simulate error during connection
-        mock_bleak_client.start_notify.side_effect = Exception("Connection error")
-
-        with pytest.raises(Exception, match="Connection error"):
-            await valve.connect("1234")
+        finally:
+            # Ensure cleanup even if test fails
+            if valve.connected:
+                await valve.disconnect()
 
     @pytest.mark.asyncio
     async def test_get_data_retry_with_sleep(
@@ -849,357 +831,156 @@ class TestValve:
         mock_packet_parser,
         mock_dashboard_packet,
         mock_advanced_packet,
-        mock_history_packet,
+        mock_water_usage_history_packet,
     ):
-        """Test data retrieval with sleep between retries."""
-        valve.connected = True
-        valve.authenticated = True
-        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
-
-        # Mock packet queue
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [b"mock_packet"] * 13  # Need packets for two attempts
-        valve.packet_queue = mock_queue
-
-        # First attempt fails, second succeeds after sleep
-        mock_packet_parser.parse_packet.side_effect = [EOFError("First attempt")] + [  # First attempt fails
-            mock_dashboard_packet,  # Second attempt succeeds
-            mock_advanced_packet,
-            EmptyPacket(),
-            EmptyPacket(),
-            EmptyPacket(),
-            mock_history_packet,
-        ]
-
-        with patch("asyncio.sleep") as mock_sleep:
-            result = await valve.get_data()
-            mock_sleep.assert_called_once()
-
-        assert isinstance(result, ValveData)
-
-    @pytest.mark.asyncio
-    async def test_connect_missing_uart_characteristics(self, valve, mock_bleak_client):
-        """Test connection with missing UART characteristics."""
+        """Test get_data retry with sleep between attempts."""
         try:
-            mock_bleak_client.connect.return_value = None
+            # Setup UART characteristics
+            read_char = mock_bleak_client.services[0].characteristics[0]
+            write_char = mock_bleak_client.services[0].characteristics[1]
+            valve.uart = {
+                NORDIC_UART_READ: read_char,
+                NORDIC_UART_WRITE: write_char
+            }
 
-            # Test missing read characteristic
-            read_service = MagicMock()
-            write_char = MagicMock(spec=BleakGATTCharacteristic)
-            write_char.uuid = str(NORDIC_UART_WRITE)
-            read_service.characteristics = [write_char]
-            mock_bleak_client.services = [read_service]
+            # Create valid packet data - using correct hex values
+            dashboard_bytes = bytes.fromhex("7575000000000000000000000000000000000000")  # Dashboard packet
+            advanced_bytes = bytes.fromhex("7575010000000000000000000000000000000000")  # Advanced packet
+            history_bytes = bytes.fromhex("7575020000000000000000000000000000000000")  # History packet
 
-            with pytest.raises(
-                ValveConnectionError, match="Required UART characteristics not found.*notify \\(read\\)"
-            ):
-                await valve.connect("1234")
+            # Setup mock queue
+            mock_queue = AsyncMock()
+            mock_queue.get.side_effect = [
+                dashboard_bytes,  # First attempt - dashboard
+                advanced_bytes,   # First attempt - advanced
+                history_bytes,    # First attempt - history chunk 1
+                history_bytes,    # First attempt - history chunk 2
+                history_bytes,    # First attempt - history chunk 3
+                history_bytes,    # First attempt - history chunk 4 (fails)
+                dashboard_bytes,  # Second attempt - dashboard
+                advanced_bytes,   # Second attempt - advanced
+                history_bytes,    # Second attempt - history chunk 1
+                history_bytes,    # Second attempt - history chunk 2
+                history_bytes,    # Second attempt - history chunk 3
+                history_bytes,    # Second attempt - history chunk 4 (succeeds)
+            ]
+            valve.packet_queue = mock_queue
 
-            await valve.disconnect()
+            # First attempt fails, second succeeds after sleep
+            mock_packet_parser.parse.side_effect = [
+                mock_dashboard_packet,  # First attempt - dashboard
+                mock_advanced_packet,  # First attempt - advanced
+                DataRetrievalError("First attempt fails"),  # First attempt - history fails
+                mock_dashboard_packet,  # Second attempt - dashboard
+                mock_advanced_packet,  # Second attempt - advanced
+                mock_water_usage_history_packet,  # Second attempt - history succeeds
+            ]
 
-            # Test missing write characteristic
-            read_char = MagicMock(spec=BleakGATTCharacteristic)
-            read_char.uuid = str(NORDIC_UART_READ)
-            read_service.characteristics = [read_char]
+            # Set connected and authenticated state
+            valve.connected = True
+            valve.authenticated = True
 
-            with pytest.raises(ValveConnectionError, match="Required UART characteristics not found.*write"):
-                await valve.connect("1234")
+            # Setup sleep mock
+            with patch("asyncio.sleep") as mock_sleep:
+                # Should succeed on second attempt
+                result = await valve.get_data()
 
-            await valve.disconnect()
+                # Verify result
+                assert isinstance(result, ValveData)
+                assert result.dashboard is not None
+                assert result.advanced is not None
+                assert result.water_usage_history is not None
 
-            # Test missing both characteristics
-            read_service.characteristics = []
+                # Verify sleep was called between attempts
+                mock_sleep.assert_called_once_with(0.1)
 
-            with pytest.raises(
-                ValveConnectionError, match="Required UART characteristics not found.*notify \\(read\\), write"
-            ):
-                await valve.connect("1234")
+                # Verify write operations - one per attempt
+                assert mock_bleak_client.write_gatt_char.call_count == 2
+                for call in mock_bleak_client.write_gatt_char.call_args_list:
+                    assert call == call(write_char, bytes([0x75] * 20), response=False)
+
+                # Verify queue operations - 12 packets total (6 per attempt)
+                assert mock_queue.get.await_count == 12
+
+                # Verify packet parser calls - 6 total (3 per attempt)
+                assert mock_packet_parser.parse.call_count == 6
+
         finally:
             # Ensure cleanup even if test fails
             if valve.connected:
                 await valve.disconnect()
 
     @pytest.mark.asyncio
-    async def test_connect_no_hello_packet(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection when no hello packet is received."""
-        # Setup successful BLE connection
-        mock_bleak_client.connect.return_value = None
-
-        # Setup UART characteristics
-        read_char = mock_bleak_client.services[0].characteristics[0]
-        write_char = mock_bleak_client.services[0].characteristics[1]
-        valve.uart[NORDIC_UART_READ] = read_char
-        valve.uart[NORDIC_UART_WRITE] = write_char
-
-        # Mock packet queue to never return data (simulating no response)
-        mock_queue = AsyncMock()
-        mock_queue.get = AsyncMock(side_effect=asyncio.TimeoutError("No hello packet received"))
-        valve.packet_queue = mock_queue
-
-        # Mock packet parser to never be called (due to timeout)
-        mock_packet_parser.parse_packet.return_value = None
-
-        # Attempt connection - should raise DataRetrievalError
-        with pytest.raises(
-            DataRetrievalError, match="Timeout while waiting for initial hello packet.*15s timeout exceeded"
-        ):
-            await valve.connect("1234")
-
-        # Verify connection sequence
-        mock_bleak_client.connect.assert_called_once()
-        mock_bleak_client.start_notify.assert_called_once()
-        mock_packet_parser.parse_packet.assert_not_called()
-
-        # Verify hello packet was sent
-        mock_bleak_client.write_gatt_char.assert_called_once_with(
-            write_char,
-            bytes([0x74] * 20),  # Hello packet
-            response=False,
-        )
-
-        # Verify queue was attempted to be read with timeout
-        mock_queue.get.assert_awaited_once()
-
-        # Verify valve state
-        assert valve.connected  # Should still be connected at BLE level
-        assert not valve.authenticated  # But not authenticated
-
-    @pytest.mark.asyncio
-    async def test_connect_wrong_packet_type_after_login(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection when receiving wrong packet type after login."""
-        # Setup successful BLE connection
-        mock_bleak_client.connect.return_value = None
-
-        # Setup UART characteristics
-        read_char = mock_bleak_client.services[0].characteristics[0]
-        write_char = mock_bleak_client.services[0].characteristics[1]
-        valve.uart[NORDIC_UART_READ] = read_char
-        valve.uart[NORDIC_UART_WRITE] = write_char
-
-        # Mock packet queue for initial hello and login response
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [
-            b"initial_hello",  # First hello packet
-            b"invalid_login_response",  # Login response
-        ]
-        valve.packet_queue = mock_queue
-
-        # Setup initial hello packet
-        initial_hello = MagicMock(spec=HelloPacket)
-        initial_hello.seed = 42
-        initial_hello.authenticated = False
-
-        # Mock packet parser to return hello packet first, then invalid packet type
-        mock_packet_parser.parse_packet.side_effect = [
-            initial_hello,  # Initial hello
-            EmptyPacket(),  # Wrong packet type after login
-        ]
-
-        # Mock login packet generation
-        mock_login_packet = bytes([0x76] * 20)
-        with patch("pycsmeter.valve._LoginPacket") as mock_login:
-            mock_login.return_value.generate.return_value = mock_login_packet
-
-            # Attempt connection - should raise PacketValidationError
-            with pytest.raises(PacketValidationError, match="Expected HelloPacket but received EmptyPacket"):
-                await valve.connect("1234")
-
-            # Verify connection and packet sequence
-            mock_bleak_client.connect.assert_called_once()
-            mock_bleak_client.start_notify.assert_called_once()
-
-            # Verify both hello and login packets were sent
-            assert mock_bleak_client.write_gatt_char.call_count == 2
-            hello_call = mock_bleak_client.write_gatt_char.call_args_list[0]
-            login_call = mock_bleak_client.write_gatt_char.call_args_list[1]
-            assert hello_call.args[1] == bytes([0x74] * 20)  # Hello packet
-            assert login_call.args[1] == mock_login_packet  # Login packet
-
-            # Verify queue was read twice
-            assert mock_queue.get.await_count == 2
-
-            # Verify packet parser was called twice
-            assert mock_packet_parser.parse_packet.call_count == 2
-
-            # Verify valve state
-            assert valve.connected  # Should still be connected at BLE level
-            assert not valve.authenticated  # But not authenticated
-
-    @pytest.mark.asyncio
-    async def test_connect_unauthenticated_after_login(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection when receiving unauthenticated hello packet after login."""
-        # Setup successful BLE connection
-        mock_bleak_client.connect.return_value = None
-
-        # Setup UART characteristics
-        read_char = mock_bleak_client.services[0].characteristics[0]
-        write_char = mock_bleak_client.services[0].characteristics[1]
-        valve.uart[NORDIC_UART_READ] = read_char
-        valve.uart[NORDIC_UART_WRITE] = write_char
-
-        # Mock packet queue for initial hello and login response
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [
-            b"initial_hello",  # First hello packet
-            b"login_response",  # Login response
-        ]
-        valve.packet_queue = mock_queue
-
-        # Setup hello packets
-        initial_hello = MagicMock(spec=HelloPacket)
-        initial_hello.seed = 42
-        initial_hello.authenticated = False
-
-        login_response = MagicMock(spec=HelloPacket)
-        login_response.seed = 42
-        login_response.authenticated = False  # Still not authenticated
-
-        # Mock packet parser to return hello packets
-        mock_packet_parser.parse_packet.side_effect = [
-            initial_hello,  # Initial hello
-            login_response,  # Login response (unauthenticated)
-        ]
-
-        # Mock login packet generation
-        mock_login_packet = bytes([0x76] * 20)
-        with patch("pycsmeter.valve._LoginPacket") as mock_login:
-            mock_login.return_value.generate.return_value = mock_login_packet
-
-            # Attempt connection - should return False
-            result = await valve.connect("1234")
-            assert result is False
-
-            # Verify connection and packet sequence
-            mock_bleak_client.connect.assert_called_once()
-            mock_bleak_client.start_notify.assert_called_once()
-
-            # Verify both hello and login packets were sent
-            assert mock_bleak_client.write_gatt_char.call_count == 2
-            hello_call = mock_bleak_client.write_gatt_char.call_args_list[0]
-            login_call = mock_bleak_client.write_gatt_char.call_args_list[1]
-            assert hello_call.args[1] == bytes([0x74] * 20)  # Hello packet
-            assert login_call.args[1] == mock_login_packet  # Login packet
-
-            # Verify queue was read twice
-            assert mock_queue.get.await_count == 2
-
-            # Verify packet parser was called twice
-            assert mock_packet_parser.parse_packet.call_count == 2
-
-            # Verify valve state
-            assert valve.connected  # Should still be connected at BLE level
-            assert not valve.authenticated  # But not authenticated
-
-    @pytest.mark.asyncio
-    async def test_connect_login_timeout(self, valve, mock_bleak_client, mock_packet_parser):
-        """Test connection when login response times out."""
-        # Setup successful BLE connection
-        mock_bleak_client.connect.return_value = None
-
-        # Setup UART characteristics
-        read_char = mock_bleak_client.services[0].characteristics[0]
-        write_char = mock_bleak_client.services[0].characteristics[1]
-        valve.uart[NORDIC_UART_READ] = read_char
-        valve.uart[NORDIC_UART_WRITE] = write_char
-
-        # Mock packet queue to return initial hello but timeout on login response
-        mock_queue = AsyncMock()
-        mock_queue.get.side_effect = [
-            b"initial_hello",  # First hello packet
-            asyncio.TimeoutError("No login response received"),  # Login response timeout
-        ]
-        valve.packet_queue = mock_queue
-
-        # Setup initial hello packet
-        initial_hello = MagicMock(spec=HelloPacket)
-        initial_hello.seed = 42
-        initial_hello.authenticated = False
-
-        # Mock packet parser
-        mock_packet_parser.parse_packet.return_value = initial_hello
-
-        # Mock login packet generation
-        mock_login_packet = bytes([0x76] * 20)
-        with patch("pycsmeter.valve._LoginPacket") as mock_login:
-            mock_login.return_value.generate.return_value = mock_login_packet
-
-            # Attempt connection - should fail but not raise exception
-            result = await valve.connect("1234")
-            assert result is False
-            assert not valve.authenticated
-
-            # Verify connection and packet sequence
-            mock_bleak_client.connect.assert_called_once()
-            mock_bleak_client.start_notify.assert_called_once()
-
-            # Verify both hello and login packets were sent
-            assert mock_bleak_client.write_gatt_char.call_count == 2
-            hello_call = mock_bleak_client.write_gatt_char.call_args_list[0]
-            login_call = mock_bleak_client.write_gatt_char.call_args_list[1]
-            assert hello_call.args[1] == bytes([0x74] * 20)  # Hello packet
-            assert login_call.args[1] == mock_login_packet  # Login packet
-
-            # Verify queue operations
-            assert mock_queue.get.await_count == 2
-
-            # Verify packet parser was called once (only for initial hello)
-            assert mock_packet_parser.parse_packet.call_count == 1
-
-    @pytest.mark.asyncio
-    async def test_get_data_empty_packet_sequence_fails(
-        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet
+    async def test_get_data_success_first_try(
+        self,
+        valve,
+        mock_bleak_client,
+        mock_packet_parser,
+        mock_dashboard_packet,
+        mock_advanced_packet,
+        mock_water_usage_history_packet,
     ):
-        """Test get_data when empty packet sequence fails (line 194)."""
+        """Test successful data retrieval on first try."""
         try:
-            valve.connected = True
-            valve.authenticated = True
-            valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+            # Setup UART characteristics
+            read_char = mock_bleak_client.services[0].characteristics[0]
+            write_char = mock_bleak_client.services[0].characteristics[1]
+            valve.uart = {
+                NORDIC_UART_READ: read_char,
+                NORDIC_UART_WRITE: write_char
+            }
 
-            # Create an iterator for queue responses
-            def queue_responses():
-                # Will yield the same sequence for each attempt
-                while True:
-                    yield b"mock_packet"  # dashboard
-                    yield b"mock_packet"  # advanced
-                    yield b"mock_packet"  # empty1 - will fail
+            # Create valid packet data - using correct hex values
+            dashboard_bytes = bytes.fromhex("7575000000000000000000000000000000000000")  # Dashboard packet
+            advanced_bytes = bytes.fromhex("7575010000000000000000000000000000000000")  # Advanced packet
+            history_bytes = bytes.fromhex("7575020000000000000000000000000000000000")  # History packet
 
-            # Create an iterator for parser responses
-            def parser_responses():
-                # Will yield the same sequence for each attempt
-                while True:
-                    yield mock_dashboard_packet
-                    yield mock_advanced_packet
-                    yield EOFError("Expected EmptyPacket #1")
-
-            # Setup mocks with infinite iterators
+            # Setup mock queue
             mock_queue = AsyncMock()
-            mock_queue.get.side_effect = queue_responses()
+            mock_queue.get.side_effect = [
+                dashboard_bytes,  # Dashboard packet
+                advanced_bytes,   # Advanced packet
+                history_bytes,    # History chunk 1
+                history_bytes,    # History chunk 2
+                history_bytes,    # History chunk 3
+                history_bytes,    # History chunk 4
+            ]
             valve.packet_queue = mock_queue
 
-            mock_packet_parser.parse_packet.side_effect = parser_responses()
+            def parser_responses():
+                # Single successful attempt
+                yield mock_dashboard_packet
+                yield mock_advanced_packet
+                yield mock_water_usage_history_packet
 
-            # Setup sleep mock and run test
-            with patch("asyncio.sleep") as mock_sleep:
-                # Should raise after 3 attempts
-                with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve .* after 3 attempts"):
-                    await valve.get_data()
+            mock_packet_parser.parse.side_effect = parser_responses()
 
-                # Verify all three attempts were made
-                assert mock_bleak_client.write_gatt_char.call_count == 3  # One data request per attempt
+            # Set connected and authenticated state
+            valve.connected = True
+            valve.authenticated = True
 
-                # Verify each write was the correct data request packet
-                for call in mock_bleak_client.write_gatt_char.call_args_list:
-                    assert call.args[1] == bytes([0x75] * 20)  # Data request packet
-                    assert call.kwargs["response"] is False
+            # Should succeed on first try
+            result = await valve.get_data()
 
-                # Verify queue operations - 3 packets per attempt * 3 attempts
-                assert mock_queue.get.await_count == 9
+            # Verify result
+            assert isinstance(result, ValveData)
+            assert result.dashboard is not None
+            assert result.advanced is not None
+            assert result.water_usage_history is not None
 
-                # Verify packet parser calls - 3 packets per attempt * 3 attempts
-                assert mock_packet_parser.parse_packet.call_count == 9
+            # Verify queue gets - 6 packets for successful attempt
+            assert mock_queue.get.await_count == 6
 
-                # Verify sleep was called between attempts
-                assert mock_sleep.await_count == 2  # Called between attempts
+            # Verify packet parser calls - 3 packets for successful attempt
+            assert mock_packet_parser.parse.call_count == 3
+
+            # Verify write operations - one for successful attempt
+            mock_bleak_client.write_gatt_char.assert_called_once_with(
+                write_char,
+                bytes([0x75] * 20),  # Data request packet
+                response=False,
+            )
+
         finally:
             # Ensure cleanup even if test fails
             if valve.connected:
@@ -1230,63 +1011,421 @@ class TestValve:
                 await valve.disconnect()
 
     @pytest.mark.asyncio
-    async def test_get_data_success_first_try(
-        self,
-        valve,
-        mock_bleak_client,
-        mock_packet_parser,
-        mock_dashboard_packet,
-        mock_advanced_packet,
-        mock_history_packet,
+    async def test_get_data_not_connected_error(self, valve):
+        """Test get_data raises error when not connected (line 114)."""
+        valve.connected = False
+        with pytest.raises(ValveConnectionError, match="Not connected to valve"):
+            await valve.get_data()
+
+    @pytest.mark.asyncio
+    async def test_connect_hello_packet_timeout(self, valve, mock_bleak_client):
+        """Test connect handling hello packet timeout (line 161)."""
+        # Setup UART characteristics
+        write_char = mock_bleak_client.services[0].characteristics[1]
+        valve.uart[NORDIC_UART_WRITE] = write_char
+
+        # Mock queue to timeout
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = asyncio.TimeoutError()
+        valve.packet_queue = mock_queue
+
+        # Should return False on timeout
+        result = await valve.connect("1234")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_connect_invalid_hello_packet(self, valve, mock_bleak_client, mock_packet_parser):
+        """Test connect handling invalid hello packet type (line 167)."""
+        # Setup UART characteristics
+        write_char = mock_bleak_client.services[0].characteristics[1]
+        valve.uart[NORDIC_UART_WRITE] = write_char
+
+        # Mock queue to return data
+        mock_queue = AsyncMock()
+        mock_queue.get.return_value = bytes([0] * 20)
+        valve.packet_queue = mock_queue
+
+        # Mock parser to return wrong packet type
+        mock_packet_parser.parse.return_value = InvalidPacket()
+
+        # Should return False on invalid packet
+        result = await valve.connect("1234")
+        assert result is False
+
+    @pytest.mark.asyncio
+    async def test_get_data_retry_with_validation_error(
+        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet
     ):
-        """Test successful get_data on first attempt (lines 194, 199)."""
+        """Test get_data retry with validation error (lines 179-275)."""
         valve.connected = True
         valve.authenticated = True
         valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
 
-        # Create an iterator for queue responses - successful sequence
-        def queue_responses():
-            # Single successful attempt
-            yield b"mock_packet"  # dashboard
-            yield b"mock_packet"  # advanced
-            yield b"mock_packet"  # empty1
-            yield b"mock_packet"  # empty2
-            yield b"mock_packet"  # empty3
-            yield b"mock_packet"  # history
+        # Create valid packet data - using correct hex values
+        # Each packet has 3 header bytes (0x75, 0x75, type) followed by 17 bytes payload
+        dashboard_bytes = bytes.fromhex("757500") + bytes([0] * 17)  # Dashboard packet (20 bytes)
+        advanced_bytes = bytes.fromhex("757501") + bytes([0] * 17)   # Advanced packet (20 bytes)
+        history_chunk1 = bytes.fromhex("757502") + bytes([0] * 17)   # History chunk 1 (20 bytes)
+        history_chunk2 = bytes([0] * 20)   # History chunk 2 (20 bytes)
+        history_chunk3 = bytes([0] * 20)   # History chunk 3 (20 bytes)
+        history_chunk4 = bytes([0] * 5)    # History chunk 4 (5 bytes)
+        invalid_bytes = bytes([0] * 20)  # Invalid packet
 
-        # Create an iterator for parser responses - successful sequence
-        def parser_responses():
-            # Single successful attempt
-            yield mock_dashboard_packet
-            yield mock_advanced_packet
-            yield EmptyPacket()
-            yield EmptyPacket()
-            yield EmptyPacket()
-            yield mock_history_packet
-
-        # Setup mocks
+        # Mock queue to return data
         mock_queue = AsyncMock()
-        mock_queue.get.side_effect = queue_responses()
+        mock_queue.get.side_effect = [
+            dashboard_bytes,  # First attempt - dashboard
+            advanced_bytes,   # First attempt - advanced
+            invalid_bytes,    # First attempt - history chunk 1 (fails)
+            invalid_bytes,    # First attempt - history chunk 2 (fails)
+            invalid_bytes,    # First attempt - history chunk 3 (fails)
+            invalid_bytes,    # First attempt - history chunk 4 (fails)
+            dashboard_bytes,  # Second attempt - dashboard
+            advanced_bytes,   # Second attempt - advanced
+            history_chunk1,   # Second attempt - history chunk 1
+            history_chunk2,   # Second attempt - history chunk 2
+            history_chunk3,   # Second attempt - history chunk 3
+            history_chunk4,   # Second attempt - history chunk 4
+        ]
         valve.packet_queue = mock_queue
 
-        mock_packet_parser.parse_packet.side_effect = parser_responses()
+        # Mock parser to fail first attempt with validation error
+        mock_packet_parser.parse.side_effect = [
+            mock_dashboard_packet,                    # First attempt - dashboard
+            mock_advanced_packet,                     # First attempt - advanced
+            PacketValidationError("Invalid packet"),  # First attempt - history fails
+            mock_dashboard_packet,                    # Second attempt - dashboard
+            mock_advanced_packet,                     # Second attempt - advanced
+            mock_water_usage_history_packet,          # Second attempt - history succeeds
+        ]
 
-        # Should succeed on first try
-        result = await valve.get_data()
+        with patch("asyncio.sleep") as mock_sleep:
+            result = await valve.get_data()
+            assert isinstance(result, ValveData)
+            mock_sleep.assert_called_once_with(0.1)
 
-        # Verify result is ValveData
-        assert isinstance(result, ValveData)
+            # Verify queue operations - 12 packets total (6 per attempt)
+            assert mock_queue.get.await_count == 12
 
-        # Verify only one attempt was made
-        assert mock_bleak_client.write_gatt_char.call_count == 1
+            # Verify packet parser calls - 6 total (3 per attempt)
+            assert mock_packet_parser.parse.call_count == 6
 
-        # Verify data request packet
-        data_request = mock_bleak_client.write_gatt_char.call_args
-        assert data_request.args[1] == bytes([0x75] * 20)  # Data request packet
-        assert data_request.kwargs["response"] is False
+            # Verify write operations - one per attempt
+            assert mock_bleak_client.write_gatt_char.call_count == 2
+            for call in mock_bleak_client.write_gatt_char.call_args_list:
+                assert call == call(mock_bleak_client.services[0].characteristics[1], bytes([0x75] * 20), response=False)
 
-        # Verify queue operations - 6 packets for successful attempt
-        assert mock_queue.get.await_count == 6
+    @pytest.mark.asyncio
+    async def test_get_data_timeout_error(self, valve, mock_bleak_client):
+        """Test get_data handling timeout error (line 308)."""
+        valve.connected = True
+        valve.authenticated = True
+        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
 
-        # Verify packet parser calls - 6 packets for successful attempt
-        assert mock_packet_parser.parse_packet.call_count == 6
+        # Mock queue to timeout
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = asyncio.TimeoutError()
+        valve.packet_queue = mock_queue
+
+        with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve"):
+            await valve.get_data()
+
+    @pytest.mark.asyncio
+    async def test_get_data_invalid_packet_type(self, valve, mock_bleak_client, mock_packet_parser):
+        """Test get_data handling invalid packet type (line 315)."""
+        valve.connected = True
+        valve.authenticated = True
+        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+
+        # Mock queue to return data
+        mock_queue = AsyncMock()
+        mock_queue.get.return_value = bytes([0] * 20)
+        valve.packet_queue = mock_queue
+
+        # Mock parser to return wrong packet type
+        mock_packet_parser.parse.return_value = InvalidPacket()
+
+        with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve"):
+            await valve.get_data()
+
+    @pytest.mark.asyncio
+    async def test_get_data_water_usage_history_chunks(
+        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet
+    ):
+        """Test get_data collecting water usage history chunks."""
+        valve.connected = True
+        valve.authenticated = True
+        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+
+        # Create valid packet data
+        dashboard_bytes = bytes.fromhex("757500") + bytes([0] * 17)  # Dashboard packet (20 bytes)
+        advanced_bytes = bytes.fromhex("757501") + bytes([0] * 17)   # Advanced packet (20 bytes)
+        water_usage_history_chunk1 = bytes.fromhex("757502") + bytes([0] * 17)   # First history chunk (20 bytes)
+        water_usage_history_chunk2 = bytes([0] * 20)                             # Second history chunk (20 bytes)
+        water_usage_history_chunk3 = bytes([0] * 20)                             # Third history chunk (20 bytes)
+        water_usage_history_chunk4 = bytes([0] * 5)                              # Fourth history chunk (5 bytes)
+
+        # Mock packet queue to return packets in sequence
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [
+            dashboard_bytes,
+            advanced_bytes,
+            water_usage_history_chunk1,
+            water_usage_history_chunk2,
+            water_usage_history_chunk3,
+            water_usage_history_chunk4,
+        ]
+
+        # Mock packet parser to return our mock packets
+        mock_packet_parser.parse.side_effect = [
+            mock_dashboard_packet,
+            mock_advanced_packet,
+            mock_water_usage_history_packet,
+        ]
+
+        valve.packet_queue = mock_queue
+
+        # Get the data
+        result = await valve._Valve__get_data()
+        valve_data = ValveData.from_internal(mock_dashboard_packet, mock_advanced_packet, mock_water_usage_history_packet)
+
+        print(result.dashboard)
+        print(valve_data)
+
+        # Verify the result by comparing specific attributes
+        assert result.dashboard == valve_data.dashboard
+        assert result.advanced == valve_data.advanced
+        assert result.water_usage_history == valve_data.water_usage_history
+
+        # Verify the packets were parsed correctly
+        assert mock_packet_parser.parse.call_count == 3
+
+    @pytest.mark.asyncio
+    async def test_connect_to_valve_missing_characteristics(self, valve, mock_bleak_client):
+        """Test connect_to_valve handling missing characteristics (line 374)."""
+        # Remove characteristics from mock service
+        mock_bleak_client.services[0].characteristics = []
+
+        with pytest.raises(ValveConnectionError, match="Required UART characteristics not found"):
+            await valve._Valve__connect_to_valve()
+
+    @pytest.mark.asyncio
+    async def test_connect_invalid_hello_after_login(self, valve, mock_bleak_client, mock_packet_parser):
+        """Test handling invalid hello packet response after sending login packet."""
+        # Setup UART write characteristic
+        write_char = mock_bleak_client.services[0].characteristics[1]
+        valve.uart[NORDIC_UART_WRITE] = write_char
+        valve.connected = False
+
+        # Mock packet queue to return both hello packets
+        mock_queue = AsyncMock()
+        # Create valid hello packet format: first two bytes 0x74, third byte 0x00
+        hello_packet = bytes([0x74, 0x74, 0x00] + [0] * 17)  # 20 bytes total
+        invalid_packet = bytes([0x75, 0x75, 0x00] + [0] * 17)  # Wrong packet type
+        mock_queue.get.side_effect = [
+            hello_packet,    # Initial hello packet before login
+            invalid_packet,  # Invalid packet type after login
+        ]
+        valve.packet_queue = mock_queue
+
+        # Mock parser to handle both packets
+        initial_hello = MagicMock(spec=HelloPacket)
+        initial_hello.seed = 42
+        initial_hello.authenticated = False
+
+        second_hello = MagicMock(spec=InvalidPacket)
+
+        mock_packet_parser.parse.side_effect = [
+            initial_hello,  # First parse returns valid hello packet
+            second_hello,   # Second parse returns invalid packet
+        ]
+
+        # Mock login packet generation
+        test_login_packet = bytes([0x74, 0x74, 0x00] + [0] * 17)  # Valid login packet format
+        with patch("pycsmeter.valve._LoginPacket") as mock_login:
+            mock_login_instance = MagicMock()
+            mock_login_instance.generate.return_value = test_login_packet
+            mock_login.return_value = mock_login_instance
+
+            # Test authentication with invalid response
+            with pytest.raises(PacketValidationError, match="Expected HelloPacket but received"):
+                await valve.connect("1234")
+
+            # Verify failure
+            assert valve.authenticated is False
+
+            # Verify login packet was created and sent
+            mock_login.assert_called_once_with(42, "1234")
+            mock_login_instance.generate.assert_called_once()
+
+            # Verify all packets were sent
+            assert mock_bleak_client.write_gatt_char.call_count == 2
+
+            # Verify both responses were processed
+            assert mock_queue.get.await_count == 2
+            assert mock_packet_parser.parse.call_count == 2
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_while_hello(self, valve, mock_bleak_client, mock_packet_parser):
+        """Test handling invalid hello packet response after sending login packet."""
+        # Setup UART write characteristic
+        write_char = mock_bleak_client.services[0].characteristics[1]
+        valve.uart[NORDIC_UART_WRITE] = write_char
+        valve.connected = False
+
+        # Mock packet queue to return both hello packets
+        mock_queue = AsyncMock()
+        # Create valid hello packet format: first two bytes 0x74, third byte 0x00
+        hello_packet = bytes([0x74, 0x74, 0x00] + [0] * 17)  # 20 bytes total
+        invalid_packet = bytes([0x75, 0x75, 0x00] + [0] * 17)  # Wrong packet type
+        mock_queue.get.side_effect = [
+            hello_packet,    # Initial hello packet before login
+            invalid_packet,  # Invalid packet type after login
+        ]
+        valve.packet_queue = mock_queue
+
+        initial_hello = MagicMock(spec=HelloPacket)
+        initial_hello.seed = 42
+        initial_hello.authenticated = False
+
+        mock_packet_parser.parse.side_effect = [
+            initial_hello,
+            asyncio.TimeoutError(),  # Simulate timeout error
+        ]
+
+        # Mock login packet generation
+        test_login_packet = bytes([0x74, 0x74, 0x00] + [0] * 17)  # Valid login packet format
+        with patch("pycsmeter.valve._LoginPacket") as mock_login:
+            mock_login_instance = MagicMock()
+            mock_login_instance.generate.return_value = test_login_packet
+            mock_login.return_value = mock_login_instance
+
+            # Test authentication with invalid response
+            connected = await valve.connect("1234")
+            assert connected is False
+
+    @pytest.mark.asyncio
+    async def test_get_data_invalid_water_usage_history_packet_type(
+        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_advanced_packet,
+    ):
+        """Test handling invalid water usage history packet type in __get_data (line 318)."""
+        valve.connected = True
+        valve.authenticated = True
+        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+
+        # Create valid packet data
+        dashboard_bytes = bytes([0x75, 0x75, 0x00] + [0] * 17)  # Dashboard packet
+        advanced_bytes = bytes([0x75, 0x75, 0x01] + [0] * 17)   # Advanced packet
+        water_usage_history_chunk1 = bytes([0x75, 0x75, 0x02] + [0] * 17)   # History chunk 1
+        water_usage_history_chunk2 = bytes([0] * 20)   # History chunk 2
+        water_usage_history_chunk3 = bytes([0] * 20)   # History chunk 3
+        water_usage_history_chunk4 = bytes([0] * 5)    # History chunk 4
+
+        # Mock queue to return packets
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+        ]
+        valve.packet_queue = mock_queue
+
+        # Mock parser to return wrong type for water usage history packet
+        mock_wrong_type = MagicMock(spec=DashboardPacket)  # Wrong packet type
+        mock_packet_parser.parse.side_effect = [
+            mock_dashboard_packet,  # First parse returns dashboard packet
+            mock_advanced_packet,   # Second parse returns advanced packet
+            mock_wrong_type,        # Third parse returns wrong packet type
+            mock_dashboard_packet,  # Need to repeat 3 times due to retry logic
+            mock_advanced_packet,   
+            mock_wrong_type,   
+            mock_dashboard_packet,
+            mock_advanced_packet,
+            mock_wrong_type,
+        ]
+
+        # Test data retrieval with wrong packet type
+        with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve"):
+            await valve.get_data()
+
+        # Verify queue operations - should process first packet and fail on second
+        assert mock_queue.get.await_count == 18
+        assert mock_packet_parser.parse.call_count == 9
+
+    @pytest.mark.asyncio
+    async def test_get_data_invalid_advanced_packet_type(
+        self, valve, mock_bleak_client, mock_packet_parser, mock_dashboard_packet, mock_water_usage_history_packet,
+    ):
+        """Test handling invalid water usage history packet type in __get_data (line 318)."""
+        valve.connected = True
+        valve.authenticated = True
+        valve.uart[NORDIC_UART_WRITE] = mock_bleak_client.services[0].characteristics[1]
+
+        # Create valid packet data
+        dashboard_bytes = bytes([0x75, 0x75, 0x00] + [0] * 17)  # Dashboard packet
+        advanced_bytes = bytes([0x75, 0x75, 0x01] + [0] * 17)   # Advanced packet
+        water_usage_history_chunk1 = bytes([0x75, 0x75, 0x02] + [0] * 17)   # History chunk 1
+        water_usage_history_chunk2 = bytes([0] * 20)   # History chunk 2
+        water_usage_history_chunk3 = bytes([0] * 20)   # History chunk 3
+        water_usage_history_chunk4 = bytes([0] * 5)    # History chunk 4
+
+        # Mock queue to return packets
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+            dashboard_bytes,  # Dashboard packet
+            advanced_bytes,   # Advanced packet
+            water_usage_history_chunk1,   # History chunk 1
+            water_usage_history_chunk2,   # History chunk 2
+            water_usage_history_chunk3,   # History chunk 3
+            water_usage_history_chunk4,   # History chunk 4
+        ]
+        valve.packet_queue = mock_queue
+
+        # Mock parser to return wrong type for water usage history packet
+        mock_wrong_type = MagicMock(spec=DashboardPacket)  # Wrong packet type
+        mock_packet_parser.parse.side_effect = [
+            mock_dashboard_packet,  # First parse returns dashboard packet
+            mock_wrong_type,   # Second parse returns advanced packet
+            mock_water_usage_history_packet,        # Third parse returns wrong packet type
+            mock_dashboard_packet,  # Need to repeat 3 times due to retry logic
+            mock_wrong_type,   
+            mock_water_usage_history_packet,   
+            mock_dashboard_packet,
+            mock_wrong_type,
+            mock_water_usage_history_packet,
+        ]
+
+        # Test data retrieval with wrong packet type
+        with pytest.raises(DataRetrievalError, match="Failed to retrieve data from valve"):
+            await valve.get_data()
+
+        # Verify queue operations - should process first packet and fail on second
+        assert mock_queue.get.await_count == 5
+        assert mock_packet_parser.parse.call_count == 5

@@ -1,7 +1,7 @@
-"""Tests for the _packets module."""
+"""Tests for packet parsing and handling."""
 
 import json
-from datetime import date, timedelta
+from datetime import date, timedelta, datetime, timezone
 import warnings
 import pytest
 from unittest.mock import patch
@@ -9,10 +9,9 @@ from unittest.mock import patch
 from pycsmeter._packets import (
     AdvancedPacket,
     DashboardPacket,
-    EmptyPacket,
     HelloPacket,
-    HistoryItem,
-    HistoryPacket,
+    WaterUsageHistoryItem,
+    WaterUsageHistoryPacket,
     InvalidPacket,
     LoginPacket,
     PacketParser,
@@ -89,7 +88,7 @@ def valid_history_items(valid_date):
     items = []
     current_date = valid_date
     for i in range(62):
-        items.append(HistoryItem(item_date=current_date, gallon_per_day=float(i * 10)))
+        items.append(HistoryItem(date=current_date, gallons_per_day=float(i * 10)))
         current_date -= timedelta(days=1)
     return items
 
@@ -119,58 +118,28 @@ def valid_hello_packet(valid_hello_data):
 
 
 @pytest.fixture
-def valid_history_packet(valid_history_items):
-    """Create a valid history packet."""
-    return HistoryPacket(valid_history_items)
+def valid_history_chunks():
+    """Create valid history packet chunks."""
+    chunk1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])  # 19 bytes
+    chunk2 = bytearray([i for i in range(20)])  # 20 bytes
+    chunk3 = bytearray([i for i in range(20)])  # 20 bytes
+    chunk4 = bytearray([i for i in range(5)])   # 5 bytes
+    return [bytes(chunk1), bytes(chunk2), bytes(chunk3), bytes(chunk4)]
 
 
 @pytest.fixture
-def valid_valve_data(valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+def valid_water_usage_history_packet(valid_history_chunks):
+    """Create a valid history packet."""
+    return WaterUsageHistoryPacket(valid_history_chunks)
+
+
+@pytest.fixture
+def valid_valve_data(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
     """Create a valid valve data object."""
-    return ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
-
-
-class TestEmptyPacket:
-    """Tests for EmptyPacket."""
-
-    def test_empty_packet_creation(self):
-        """Test creating an empty packet."""
-        packet = EmptyPacket()
-        assert isinstance(packet, EmptyPacket)
-
-    def test_empty_packet_validation(self):
-        """Test validating an empty packet."""
-        packet = EmptyPacket()
-        packet.validate()  # Should not raise
-
-    def test_empty_packet_from_bytes(self):
-        """Test creating empty packet from bytes."""
-        packet = EmptyPacket.from_bytes(b"test")
-        assert isinstance(packet, EmptyPacket)
-        packet = EmptyPacket.from_bytes(None)
-        assert isinstance(packet, EmptyPacket)
-
-    def test_empty_packet_json(self):
-        """Test JSON serialization of empty packet."""
-        packet = EmptyPacket()
-        json_str = packet.to_json()
-        assert json.loads(json_str) == {}
-
-    def test_empty_packet_repr(self):
-        """Test string representation of empty packet."""
-        packet = EmptyPacket()
-        assert repr(packet) == "<ValveEmptyPacket>"
-
-    def test_empty_packet_equality(self):
-        """Test equality comparison of empty packets."""
-        packet1 = EmptyPacket()
-        packet2 = EmptyPacket()
-        assert packet1 == packet2
-        assert packet1 != object()
-
+    return ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
 
 class TestInvalidPacket:
-    """Tests for InvalidPacket."""
+    """Tests for InvalidPacket."""  
 
     def test_invalid_packet_creation(self):
         """Test creating an invalid packet."""
@@ -360,169 +329,207 @@ class TestAdvancedPacket:
         assert packet.regen_days == 7
         assert packet.days_to_regen == 3
 
+class TestWaterUsageHistoryPacket:
+    """Tests for WaterUsageHistoryPacket."""
 
-class TestHistoryItem:
-    """Tests for HistoryItem."""
+    def test_history_packet_creation(self, valid_history_chunks):
+        """Test creating a history packet from chunks."""
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
+        assert len(packet.history_data) == 62
 
-    def test_history_item_creation(self, valid_date):
-        """Test creating a history item."""
-        item = HistoryItem(item_date=valid_date, gallon_per_day=100.0)
-        assert item.item_date == valid_date
-        assert item.gallon_per_day == 100.0
+    def test_history_packet_creation_invalid_chunks(self):
+        """Test creating a history packet from invalid chunks."""
+        # Test invalid first chunk
+        invalid_chunk1 = bytearray([0x00, 0x00, 0] + [i for i in range(17)])
+        chunk2 = bytearray([i for i in range(20)])
+        chunk3 = bytearray([i for i in range(20)])
+        chunk4 = bytearray([i for i in range(5)])
 
-    def test_history_item_validation(self, valid_date):
-        """Test history item validation."""
-        item = HistoryItem(item_date=valid_date, gallon_per_day=100.0)
-        item.validate()  # Should not raise
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket([bytes(invalid_chunk1), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
 
-        # Test invalid values
-        with pytest.raises(TypeError, match="gallon_per_day must be numeric"):
-            HistoryItem(item_date=valid_date, gallon_per_day="100").validate()
+        # Test short second chunk
+        chunk1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
+        short_chunk2 = bytearray([i for i in range(10)])
+        with pytest.raises(PacketParseError, match="Second history chunk too short"):
+            WaterUsageHistoryPacket([bytes(chunk1), bytes(short_chunk2), bytes(chunk3), bytes(chunk4)])
 
-        with pytest.raises(TypeError, match="gallon_per_day out of range"):
-            HistoryItem(item_date=valid_date, gallon_per_day=2551.0).validate()
+        # Test short third chunk
+        short_chunk3 = bytearray([i for i in range(10)])
+        with pytest.raises(PacketParseError, match="Third history chunk too short"):
+            WaterUsageHistoryPacket([bytes(chunk1), bytes(chunk2), bytes(short_chunk3), bytes(chunk4)])
 
-        with pytest.raises(ValueError, match="date must be a date object"):
-            HistoryItem(item_date="2024-01-01", gallon_per_day=100.0).validate()
+        # Test short fourth chunk
+        short_chunk4 = bytearray([i for i in range(2)])
+        with pytest.raises(PacketParseError, match="Fourth history chunk too short"):
+            WaterUsageHistoryPacket([bytes(chunk1), bytes(chunk2), bytes(chunk3), bytes(short_chunk4)])
 
-    def test_history_item_from_bytes(self, valid_date):
-        """Test creating history item from bytes."""
-        item = HistoryItem.from_bytes(valid_date, 10)  # 10 * 10.0 = 100.0 gallons
-        assert item.item_date == valid_date
-        assert item.gallon_per_day == 100.0
+        # Test no chunks
+        with pytest.raises(PacketParseError, match="No water usage history chunks provided"):
+            WaterUsageHistoryPacket([])
 
-    def test_history_item_json(self, valid_date):
-        """Test JSON serialization of history item."""
-        item = HistoryItem(item_date=valid_date, gallon_per_day=100.0)
-        json_str = item.to_json()
-        data = json.loads(json_str)
-        assert data["item_date"] == "2024-01-01"
-        assert data["gallon_per_day"] == 100.0
+    def test_history_packet_first_chunk_validation(self):
+        """Test validation of the first water usage history chunk header bytes."""
+        # Test with wrong header bytes (not 0x75 0x75)
+        invalid_header = bytearray([0x74, 0x74, 2] + [0] * 17)  # Wrong header bytes
+        chunk2 = bytearray([0] * 20)
+        chunk3 = bytearray([0] * 20)
+        chunk4 = bytearray([0] * 5)
+        
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket([bytes(invalid_header), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
+            
+        # Test with wrong type byte (not 2)
+        invalid_type = bytearray([0x75, 0x75, 1] + [0] * 17)  # Wrong type byte
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket([bytes(invalid_type), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
+            
+        # Test with too short first chunk
+        short_chunk = bytearray([0x75, 0x75, 2] + [0] * 15)  # Only 18 bytes instead of 20
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket([bytes(short_chunk), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
 
-    def test_history_item_equality(self, valid_date):
-        """Test equality comparison of history items."""
-        item1 = HistoryItem(item_date=valid_date, gallon_per_day=100.0)
-        item2 = HistoryItem(item_date=valid_date, gallon_per_day=100.0)
-        assert item1 == item2
-        assert item1 != object()
-
-
-class TestHistoryPacket:
-    """Tests for HistoryPacket."""
-
-    def test_history_packet_creation(self, valid_history_items):
-        """Test creating a history packet."""
-        packet = HistoryPacket(valid_history_items)
-        assert len(packet.history_gallons_per_day) == 62
-        assert all(isinstance(item, HistoryItem) for item in packet.history_gallons_per_day)
-
-    def test_history_packet_validation(self, valid_history_items):
+    def test_history_packet_validation_data_length(self):
+        """Test validation of history data length."""
+        # Create valid chunks but manipulate the history_data after creation
+        chunk1 = bytearray([0x75, 0x75, 2] + [0] * 17)
+        chunk2 = bytearray([0] * 20)
+        chunk3 = bytearray([0] * 20)
+        chunk4 = bytearray([0] * 5)
+        
+        packet = WaterUsageHistoryPacket([bytes(chunk1), bytes(chunk2), bytes(chunk3), bytes(chunk4)])
+        
+        # Test with too short history data
+        packet.history_data = packet.history_data[:-1]  # Remove last byte
+        with pytest.raises(ValueError, match="History data must be 62 bytes"):
+            packet.validate()
+            
+        # Test with too long history data
+        packet.history_data = packet.history_data + bytes([0, 0])  # Add two extra bytes
+        with pytest.raises(ValueError, match="History data must be 62 bytes"):
+            packet.validate()
+    
+    def test_history_packet_validation(self, valid_history_chunks):
         """Test history packet validation."""
-        packet = HistoryPacket(valid_history_items)
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
         packet.validate()  # Should not raise
 
-        with pytest.raises(ValueError, match="HistoryPacket expects 62 items"):
-            HistoryPacket([]).validate()
-
-    def test_history_packet_from_bytes(self):
-        """Test creating history packet from bytes."""
-        data = bytes([i for i in range(62)])
-        start_date = date(2024, 1, 1)  # Use a fixed date instead of now()
-        packet = HistoryPacket.from_bytes(data, start_date)
-        assert len(packet.history_gallons_per_day) == 62
-        assert all(isinstance(item, HistoryItem) for item in packet.history_gallons_per_day)
-
+        # Test invalid data length
+        packet.history_data = packet.history_data[:-1]  # Remove last byte
         with pytest.raises(ValueError, match="History data must be 62 bytes"):
-            HistoryPacket.from_bytes(b"short", start_date)
+            packet.validate()
 
-    def test_history_packet_json(self, valid_history_items):
+    def test_get_history_for_date(self, valid_history_chunks):
+        """Test getting history for specific date."""
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
+
+        # Test getting yesterday's data
+        yesterday = packet.yesterday
+        gallons = packet.get_history_for_date(yesterday)
+        assert gallons is not None
+        assert isinstance(gallons, float)
+
+        # Test getting data from 61 days ago
+        old_date = yesterday - timedelta(days=61)
+        gallons = packet.get_history_for_date(old_date)
+        assert gallons is not None
+        assert isinstance(gallons, float)
+
+        # Test getting data from too old date
+        too_old = yesterday - timedelta(days=100)
+        assert packet.get_history_for_date(too_old) is None
+
+        # Test getting future date
+        future = yesterday + timedelta(days=1)
+        assert packet.get_history_for_date(future) is None
+
+    def test_get_history_last_n_days(self, valid_history_chunks):
+        """Test getting last N days of history."""
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
+
+        # Test getting 10 days
+        history = packet.get_history_last_n_days(10)
+        assert len(history) == 10
+        assert all(isinstance(item, WaterUsageHistoryItem) for item in history)
+        assert all(isinstance(item.date, date) and isinstance(item.gallons_per_day, float) 
+                  for item in history)
+
+        # Test getting more than 62 days (should be capped)
+        history = packet.get_history_last_n_days(100)
+        assert len(history) == 62
+
+        # Test getting 0 days
+        history = packet.get_history_last_n_days(0)
+        assert len(history) == 0
+
+    def test_history_packet_json(self, valid_history_chunks):
         """Test JSON serialization of history packet."""
-        packet = HistoryPacket(valid_history_items)
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
         json_str = packet.to_json()
         data = json.loads(json_str)
         assert len(data) == 62
+        assert all("date" in item and "gallons_per_day" in item for item in data)
 
-    def test_history_packet_repr(self, valid_history_items):
+        # Test with indent
+        json_str_indented = packet.to_json(indent=2)
+        assert isinstance(json_str_indented, str)
+        assert json_str_indented.count("\n") > 0  # Should be formatted with newlines
+
+    def test_history_packet_repr(self, valid_history_chunks):
         """Test string representation of history packet."""
-        packet = HistoryPacket(valid_history_items)
-        assert repr(packet) == "<HistoryPacket 62 items>"
+        packet = WaterUsageHistoryPacket(valid_history_chunks)
+        assert repr(packet) == "<WaterUsageHistoryPacket 62 bytes>"
 
-    def test_history_packet_equality(self, valid_history_items):
-        """Test equality comparison of history packets."""
-        packet1 = HistoryPacket(valid_history_items)
-        packet2 = HistoryPacket(valid_history_items)
-        assert packet1 == packet2
-        assert packet1 != object()
+    def test_merge_history_chunks_header_validation(self):
+        """Test validation of history chunk header bytes (line 213)."""
+        # Test with wrong header bytes (not 0x75 0x75)
+        invalid_header = bytes([0x74, 0x74, 2] + [0] * 17)  # Wrong header bytes
+        chunk2 = bytes([0] * 20)
+        chunk3 = bytes([0] * 20)
+        chunk4 = bytes([0] * 5)
+        
+        with pytest.raises(PacketParseError, match="No history chunks provided"):
+            WaterUsageHistoryPacket._merge_history_chunks([])
 
-    def test_history_packet_item_validation(self, valid_date):
-        """Test validation of individual history items in a packet."""
-        # Create a list of 62 items with one invalid item
-        items = []
-        current_date = valid_date
-        for i in range(62):
-            if i == 30:  # Make one item invalid
-                # Create an item with invalid gallon_per_day
-                item = HistoryItem(item_date=current_date, gallon_per_day=3000.0)  # Over the max 2550.0
-            else:
-                item = HistoryItem(item_date=current_date, gallon_per_day=float(i * 10))
-            items.append(item)
-            current_date -= timedelta(days=1)
+        with pytest.raises(PacketParseError, match="Invalid number of history chunks"):
+            WaterUsageHistoryPacket._merge_history_chunks([invalid_header])
 
-        # Create packet and test validation
-        packet = HistoryPacket(items)
-        with pytest.raises(TypeError, match="gallon_per_day out of range: 3000.0"):
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket._merge_history_chunks([invalid_header, chunk2, chunk3, chunk4])
+            
+        # Test with wrong type byte (not 2)
+        invalid_type = bytes([0x75, 0x75, 1] + [0] * 17)  # Wrong type byte
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket._merge_history_chunks([invalid_type, chunk2, chunk3, chunk4])
+            
+        # Test with too short first chunk
+        short_chunk = bytes([0x75, 0x75, 2] + [0] * 15)  # Only 18 bytes instead of 19
+        with pytest.raises(PacketParseError, match="Invalid first water usage history chunk"):
+            WaterUsageHistoryPacket._merge_history_chunks([short_chunk, chunk2, chunk3, chunk4])
+
+    def test_history_data_length_validation(self):
+        """Test validation of history data length (line 240)."""
+        # Create a valid history packet first
+        chunk1 = bytes([0x75, 0x75, 2] + [0] * 17)  # 20 bytes with header
+        chunk2 = bytes([0] * 20)
+        chunk3 = bytes([0] * 20)
+        chunk4 = bytes([0] * 5)
+        
+        packet = WaterUsageHistoryPacket([chunk1, chunk2, chunk3, chunk4])
+        
+        # Test with too short history data
+        packet.history_data = bytes([0] * 61)  # One byte too short
+        with pytest.raises(ValueError, match="History data must be 62 bytes"):
             packet.validate()
-
-        # Test with invalid date
-        items = []
-        current_date = valid_date
-        for i in range(62):
-            if i == 30:  # Make one item have invalid date
-                item = HistoryItem(item_date="2024-01-01", gallon_per_day=100.0)  # String instead of date object
-            else:
-                item = HistoryItem(item_date=current_date, gallon_per_day=float(i * 10))
-            items.append(item)
-            current_date -= timedelta(days=1)
-
-        packet = HistoryPacket(items)
-        with pytest.raises(ValueError, match="date must be a date object"):
+            
+        # Test with too long history data
+        packet.history_data = bytes([0] * 63)  # One byte too long
+        with pytest.raises(ValueError, match="History data must be 62 bytes"):
             packet.validate()
-
-    def test_history_packet_item_count_validation(self, valid_date):
-        """Test validation of history packet item count."""
-        # Test with too few items
-        items = []
-        current_date = valid_date
-        for i in range(30):  # Only 30 items instead of 62
-            items.append(HistoryItem(item_date=current_date, gallon_per_day=float(i * 10)))
-            current_date -= timedelta(days=1)
-
-        with pytest.raises(ValueError, match="HistoryPacket expects 62 items, got 30"):
-            HistoryPacket(items)
-
-        # Test with too many items
-        items = []
-        current_date = valid_date
-        for i in range(70):  # 70 items instead of 62
-            items.append(HistoryItem(item_date=current_date, gallon_per_day=float(i * 10)))
-            current_date -= timedelta(days=1)
-
-        with pytest.raises(ValueError, match="HistoryPacket expects 62 items, got 70"):
-            HistoryPacket(items)
-
-        # Test that validation in validate() works too by modifying the list after creation
-        items = []
-        current_date = valid_date
-        for i in range(62):  # Correct number of items initially
-            items.append(HistoryItem(item_date=current_date, gallon_per_day=float(i * 10)))
-            current_date -= timedelta(days=1)
-
-        packet = HistoryPacket(items)
-        # Now modify the list to have wrong number of items
-        packet.history_gallons_per_day = packet.history_gallons_per_day[:-10]  # Remove 10 items
-        with pytest.raises(ValueError, match="HistoryPacket expects 62 items, got 52"):
-            packet.validate()
-
+            
+        # Test with exactly 62 bytes (should pass)
+        packet.history_data = bytes([0] * 62)
+        packet.validate()  # Should not raise
 
 class TestHelloPacket:
     """Tests for HelloPacket."""
@@ -663,166 +670,105 @@ class TestPacketParser:
     @pytest.mark.asyncio
     async def test_parse_hello_packet(self, parser, valid_hello_data):
         """Test parsing hello packet."""
-        result = await parser.parse_packet(valid_hello_data)
+        result = await parser.parse([valid_hello_data])
         assert isinstance(result, HelloPacket)
         assert result.seed == 42
         assert result.authenticated is True
 
+        # Test with wrong number of chunks
+        with pytest.raises(PacketParseError, match="Expected only one data chunk"):
+            await parser.parse([valid_hello_data, valid_hello_data])
+
     @pytest.mark.asyncio
     async def test_parse_dashboard_packet(self, parser, valid_dashboard_data):
         """Test parsing dashboard packet."""
-        result = await parser.parse_packet(valid_dashboard_data)
+        result = await parser.parse([valid_dashboard_data])
         assert isinstance(result, DashboardPacket)
         assert result.hour == 14
         assert result.minute == 30
 
+        # Test with wrong number of chunks
+        with pytest.raises(PacketParseError, match="Expected only one data chunk"):
+            await parser.parse([valid_dashboard_data, valid_dashboard_data])
+
     @pytest.mark.asyncio
     async def test_parse_advanced_packet(self, parser, valid_advanced_data):
         """Test parsing advanced packet."""
-        result = await parser.parse_packet(valid_advanced_data)
+        result = await parser.parse([valid_advanced_data])
         assert isinstance(result, AdvancedPacket)
         assert result.regen_days == 7
         assert result.days_to_regen == 3
 
+        # Test with wrong number of chunks
+        with pytest.raises(PacketParseError, match="Expected only one data chunk"):
+            await parser.parse([valid_advanced_data, valid_advanced_data])
+
     @pytest.mark.asyncio
-    async def test_parse_history_packet(self, parser):
-        """Test parsing history packet sequence."""
-        # First chunk
-        data1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
-        result = await parser.parse_packet(bytes(data1))
-        assert isinstance(result, EmptyPacket)
+    async def test_parse_history_packet(self, parser, valid_history_chunks):
+        """Test parsing history packet chunks."""
+        result = await parser.parse(valid_history_chunks)
+        assert isinstance(result, WaterUsageHistoryPacket)
+        assert len(result.history_data) == 62
 
-        # Second chunk
-        data2 = bytearray([i for i in range(20)])
-        result = await parser.parse_packet(bytes(data2))
-        assert isinstance(result, EmptyPacket)
-
-        # Third chunk
-        data3 = bytearray([i for i in range(20)])
-        result = await parser.parse_packet(bytes(data3))
-        assert isinstance(result, EmptyPacket)
-
-        # Final chunk
-        data4 = bytearray([i for i in range(5)])
-        result = await parser.parse_packet(bytes(data4))
-        assert isinstance(result, HistoryPacket)
-        assert len(result.history_gallons_per_day) == 62
+        # Test with wrong number of chunks
+        with pytest.raises(PacketParseError, match="Expected four data chunks"):
+            await parser.parse(valid_history_chunks[:3])
 
     @pytest.mark.asyncio
     async def test_parse_unknown_packet(self, parser):
         """Test parsing unknown packet type."""
         with pytest.raises(PacketParseError, match="Unknown packet type"):
-            await parser.parse_packet(b"unknown")
+            await parser.parse([bytes([0x00] * 20)])
 
     @pytest.mark.asyncio
-    async def test_parse_invalid_history_sequence(self, parser):
-        """Test parsing invalid history packet sequence."""
-        # Start history sequence
-        data1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
-        result = await parser.parse_packet(bytes(data1))
-        assert isinstance(result, EmptyPacket)
-
-        # Send invalid short packet
-        data2 = bytearray([i for i in range(6)])
-        result = await parser.parse_packet(bytes(data2))
-        assert isinstance(result, InvalidPacket)
-        assert not parser.history_data  # Buffer should be cleared
-
-    @pytest.mark.asyncio
-    async def test_parse_invalid_history_sequence_short_second_chunk(self, parser):
-        """Test parsing invalid history packet sequence with short second chunk."""
-        # Start history sequence
-        data1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
-        result = await parser.parse_packet(bytes(data1))
-        assert isinstance(result, EmptyPacket)
-
-        # Send invalid short packet (6 bytes) when expecting 20 bytes
-        data2 = bytearray([i for i in range(6)])
-        result = await parser.parse_packet(bytes(data2))
-        assert isinstance(result, InvalidPacket)
-        assert not parser.history_data  # Buffer should be cleared
-
-    @pytest.mark.asyncio
-    async def test_parse_invalid_history_sequence_short_third_chunk(self, parser):
-        """Test parsing invalid history packet sequence with short third chunk."""
-        # Start history sequence
-        data1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
-        result = await parser.parse_packet(bytes(data1))
-        assert isinstance(result, EmptyPacket)
-
-        # Send second chunk (20 bytes)
-        data2 = bytearray([i for i in range(20)])
-        result = await parser.parse_packet(bytes(data2))
-        assert isinstance(result, EmptyPacket)
-        assert len(parser.history_data) == 37  # First chunk (17) + second chunk (20)
-
-        # Send invalid short packet (6 bytes) when expecting 20 bytes
-        data3 = bytearray([i for i in range(6)])
-        result = await parser.parse_packet(bytes(data3))
-        assert isinstance(result, InvalidPacket)
-        assert not parser.history_data  # Buffer should be cleared
-
-    @pytest.mark.asyncio
-    async def test_parse_invalid_history_sequence_unexpected_length(self, parser):
-        """Test parsing history packet sequence with unexpected buffer length."""
-        # Start history sequence
-        data1 = bytearray([0x75, 0x75, 2] + [i for i in range(17)])
-        result = await parser.parse_packet(bytes(data1))
-        assert isinstance(result, EmptyPacket)
-
-        # Manually set history_data to unexpected length
-        parser.history_data = [0] * 25  # Not 17, 37, or 57
-
-        # Send next chunk
-        data2 = bytearray([i for i in range(20)])
-        result = await parser.parse_packet(bytes(data2))
-        assert isinstance(result, InvalidPacket)
-        assert not parser.history_data  # Buffer should be cleared
+    async def test_parse_empty_data(self, parser):
+        """Test parsing with no data."""
+        with pytest.raises(PacketParseError, match="No data provided"):
+            await parser.parse([])
 
 
 class TestValveData:
     """Tests for ValveData class."""
 
-    def test_valve_data_creation(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_valve_data_creation(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test creating valve data."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         assert isinstance(valve_data.dashboard, DashboardPacket)
         assert isinstance(valve_data.advanced, AdvancedPacket)
-        assert isinstance(valve_data.history, HistoryPacket)
+        assert isinstance(valve_data.water_usage_history, WaterUsageHistoryPacket)
 
-    def test_get_history(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_get_history(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test getting history items."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         history = valve_data.get_history()
         assert len(history) == 62
-        assert all(isinstance(item, HistoryItem) for item in history)
+        assert all(isinstance(item, WaterUsageHistoryItem) for item in history)
 
-    def test_get_history_for_date(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_get_history_for_date(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test getting history for specific date."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
-        today = date(2024, 1, 1)
-        history_item = valve_data.get_history_for_date(today)
-        assert isinstance(history_item, HistoryItem)
-        assert history_item.item_date == today
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
+        gallons = valve_data.get_history_for_date(valid_water_usage_history_packet.yesterday)
+        assert gallons is not None
+        assert isinstance(gallons, float)
 
         # Test non-existent date
         assert valve_data.get_history_for_date(date(2000, 1, 1)) is None
 
-    def test_get_history_last_n_days(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_get_history_last_n_days(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test getting last N days of history."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         history = valve_data.get_history_last_n_days(10)
         assert len(history) == 10
-        assert all(isinstance(item, HistoryItem) for item in history)
+        assert all(isinstance(item, WaterUsageHistoryItem) for item in history)
 
-    def test_validate(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_validate(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test validating valve data."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         valve_data.validate()  # Should not raise
 
-    def test_to_json(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_to_json(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test JSON serialization of valve data."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         json_str = valve_data.to_json()
         data = json.loads(json_str)
         assert "dashboard" in data
@@ -834,9 +780,9 @@ class TestValveData:
         assert isinstance(json_str_indented, str)
         assert json_str_indented.count("\n") > 0  # Should be formatted with newlines
 
-    def test_repr(self, valid_dashboard_packet, valid_advanced_packet, valid_history_packet):
+    def test_repr(self, valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet):
         """Test string representation of valve data."""
-        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_history_packet)
+        valve_data = ValveData(valid_dashboard_packet, valid_advanced_packet, valid_water_usage_history_packet)
         repr_str = repr(valve_data)
         assert repr_str.startswith("<ValveData")
         assert "dashboard=" in repr_str

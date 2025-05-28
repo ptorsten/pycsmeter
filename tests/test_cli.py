@@ -1,16 +1,23 @@
 """Tests for the CLI interface."""
 
 import asyncio
-from datetime import date
+from datetime import date, timedelta
 from unittest.mock import AsyncMock, patch
 import warnings
 
 import pytest
 from click.testing import CliRunner
 
+from pycsmeter._packets import (
+    DashboardPacket,
+    AdvancedPacket,
+    WaterUsageHistoryPacket,
+    WaterUsageHistoryItem,
+    PacketParseError,
+)
 from pycsmeter.cli import main
 from pycsmeter.exceptions import AuthenticationError, ValveConnectionError
-from pycsmeter.valve import AdvancedData, DashboardData, HistoryItem, ValveData
+from pycsmeter.valve import AdvancedData, DashboardData, ValveData
 
 
 @pytest.fixture(autouse=True)
@@ -62,11 +69,11 @@ def mock_valve_data():
     )
 
     history = [
-        HistoryItem(item_date=date(2024, 1, 1), gallons_per_day=100.0),
-        HistoryItem(item_date=date(2024, 1, 2), gallons_per_day=150.0),
+        WaterUsageHistoryItem(date=date(2024, 1, 1), gallons_per_day=100.0),
+        WaterUsageHistoryItem(date=date(2024, 1, 2), gallons_per_day=150.0),
     ]
 
-    return ValveData(dashboard=dashboard, advanced=advanced, history=history)
+    return ValveData(dashboard=dashboard, advanced=advanced, water_usage_history=history)
 
 
 def test_connect_success(mock_valve):
@@ -120,7 +127,7 @@ def test_status_success(mock_valve, mock_valve_data):
     # Verify all sections are present
     assert "=== Dashboard ===" in result.output
     assert "=== Advanced Settings ===" in result.output
-    assert "=== Recent History ===" in result.output
+    assert "=== Recent Water Usage History ===" in result.output
     # Verify some key data points
     assert "14:30" in result.output  # Time
     assert "3.3V" in result.output  # Battery

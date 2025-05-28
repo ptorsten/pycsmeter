@@ -36,12 +36,12 @@ def _format_valve_data(data: ValveData) -> str:
     output.append(tabulate(advanced_data, tablefmt="simple"))
 
     # History section
-    output.append("\n=== Recent History ===")
-    history_data = [
-        [item.item_date.strftime("%Y-%m-%d"), f"{item.gallons_per_day:.1f} gallons"]
-        for item in data.history[:14]  # Show last 14 days
+    output.append("\n=== Recent Water Usage History ===")
+    water_usage_history_data = [
+        [item.date.strftime("%Y-%m-%d"), f"{item.gallons_per_day:.1f} gallons"]
+        for item in data.water_usage_history[:14]  # Show last 14 days
     ]
-    output.append(tabulate(history_data, headers=["Date", "Usage"], tablefmt="simple"))
+    output.append(tabulate(water_usage_history_data, headers=["Date", "Usage"], tablefmt="simple"))
 
     return "\n".join(output)
 
@@ -62,7 +62,6 @@ async def _connect_valve(address: str, password: str) -> Optional[Valve]:
 
     return valve
 
-
 @click.group()
 def main() -> None:
     """Command line interface for interacting with CS water softener valves."""
@@ -74,8 +73,9 @@ def main() -> None:
 def connect(address: str, password: str) -> None:
     """Test connection to a valve.
 
-    ADDRESS: The Bluetooth address of the valve (e.g. 00:11:22:33:44:55)
-    PASSWORD: The valve's connection password
+    Parameters:
+        address: The Bluetooth address of the valve (e.g. 00:11:22:33:44:55)
+        password: The valve's connection password
     """
 
     async def _run() -> None:
@@ -93,14 +93,16 @@ def connect(address: str, password: str) -> None:
 def status(address: str, password: str) -> None:
     """Get current status from a valve.
 
-    ADDRESS: The Bluetooth address of the valve (e.g. 00:11:22:33:44:55)
-    PASSWORD: The valve's connection password
+    Parameters:
+        address: The Bluetooth address of the valve (e.g. 00:11:22:33:44:55)
+        password: The valve's connection password
     """
 
     async def _run() -> None:
         valve = await _connect_valve(address, password)
         if valve:
             try:
+                # await valve.get_data2()
                 data = await valve.get_data()
                 click.echo(_format_valve_data(data))
             except Exception as e:  # noqa: BLE001
